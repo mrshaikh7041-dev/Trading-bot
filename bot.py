@@ -5,23 +5,23 @@ import pandas as pd
 from datetime import datetime
 
 # ----------------- CONFIG -----------------
-API_KEY    = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
 if not API_KEY or not API_SECRET:
     raise SystemExit("❌ API_KEY / API_SECRET missing! Set them in AWS environment variables.")
 
-SYMBOL           = "ETH/USDT"
-LOT_SIZE         = 0.01
-LEVERAGE         = 100
-TIMEFRAME        = "1m"
-EMA_FAST         = 13
-EMA_SLOW         = 55
-TP_POINTS        = 30.0
-SL_POINTS        = 50.0
+SYMBOL = "ETH/USDT"
+LOT_SIZE = 0.01
+LEVERAGE = 100
+TIMEFRAME = "1m"
+EMA_FAST = 13
+EMA_SLOW = 55
+TP_POINTS = 30.0
+SL_POINTS = 40.0
 COOLDOWN_AFTER_1_SL = 60
-WORKING_TYPE     = "MARK_PRICE"
-CANDLE_LIMIT     = 50
+WORKING_TYPE = "MARK_PRICE"
+CANDLE_LIMIT = 50  # rolling window for signals
 
 # ----------------- EXCHANGE -----------------
 exchange = ccxt.binance({
@@ -31,10 +31,10 @@ exchange = ccxt.binance({
     "options": {"defaultType": "future", "adjustForTimeDifference": True}
 })
 
+# ----------------- HELPERS -----------------
 def log(*args):
     print(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), *args, flush=True)
 
-# ----------------- HELPERS -----------------
 def show_balance():
     try:
         balance = exchange.fetch_balance({"type": "future"})
@@ -58,6 +58,9 @@ def fetch_ema_df(sym, tf="1m", limit=CANDLE_LIMIT):
     df.set_index("time", inplace=True)
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    # rolling window averages for backtest-style entry
+    df["ema_fast_window"] = df["ema_fast"].rolling(window=CANDLE_LIMIT).mean()
+    df["ema_slow_window"] = df["ema_slow"].rolling(window=CANDLE_LIMIT).mean()
     return df
 
 def latest_price(sym):
@@ -114,8 +117,10 @@ def cancel_open_reduce_only(sym):
 def run_bot():
     show_balance()
     ensure_leverage(SYMBOL, LEVERAGE)
+
     sl_streak = 0
     cooldown = 0
+
     log(f"🚀 Starting Futures Bot | Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Lot: {LOT_SIZE} | Candle Window: {CANDLE_LIMIT}")
 
     in_position = False
@@ -127,7 +132,6 @@ def run_bot():
     while True:
         try:
             df = fetch_ema_df(SYMBOL, TIMEFRAME, limit=CANDLE_LIMIT)
-            last_t = df.index[-1]
 
             if cooldown > 0:
                 log(f"Cooldown active: {cooldown} candles remaining")
@@ -137,13 +141,15 @@ def run_bot():
 
             # --- SINGLE TRADE LOGIC ---
             if not in_position:
-                ef, es = df["ema_fast"].iloc[-1], df["ema_slow"].iloc[-1]
-                ef_prev, es_prev = df["ema_fast"].iloc[-2], df["ema_slow"].iloc[-2]
+                ef_win, es_win = df["ema_fast_window"].iloc[-1], df["ema_slow_window"].iloc[-1]
+                if pd.isna(ef_win) or pd.isna(es_win):
+                    time.sleep(2)
+                    continue
 
                 side = None
-                if ef_prev <= es_prev and ef > es:
+                if ef_win > es_win:
                     side = "buy"
-                elif ef_prev >= es_prev and ef < es:
+                elif ef_win < es_win:
                     side = "sell"
 
                 if side is None:
@@ -218,6 +224,7 @@ def run_bot():
             time.sleep(5)
             continue
 
+# ----------------- RUN BOT -----------------
 if __name__ == "__main__":
     while True:  # AWS auto-restart loop
         try:
