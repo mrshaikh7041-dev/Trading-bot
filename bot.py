@@ -58,7 +58,6 @@ def fetch_ema_df(sym, tf="1m", limit=CANDLE_LIMIT):
     df.set_index("time", inplace=True)
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-    # rolling window averages for backtest-style entry
     df["ema_fast_window"] = df["ema_fast"].rolling(window=CANDLE_LIMIT).mean()
     df["ema_slow_window"] = df["ema_slow"].rolling(window=CANDLE_LIMIT).mean()
     return df
@@ -120,6 +119,7 @@ def run_bot():
 
     sl_streak = 0
     cooldown = 0
+    last_trade_candle = None   # NEW
 
     log(f"🚀 Starting Futures Bot | Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Lot: {LOT_SIZE} | Candle Window: {CANDLE_LIMIT}")
 
@@ -132,6 +132,7 @@ def run_bot():
     while True:
         try:
             df = fetch_ema_df(SYMBOL, TIMEFRAME, limit=CANDLE_LIMIT)
+            current_candle = df.index[-1]   # NEW
 
             if cooldown > 0:
                 log(f"Cooldown active: {cooldown} candles remaining")
@@ -139,8 +140,8 @@ def run_bot():
                 cooldown -= 1
                 continue
 
-            # --- SINGLE TRADE LOGIC ---
-            if not in_position:
+            # --- ENTRY LOGIC ---
+            if not in_position and current_candle != last_trade_candle:
                 ef_win, es_win = df["ema_fast_window"].iloc[-1], df["ema_slow_window"].iloc[-1]
                 if pd.isna(ef_win) or pd.isna(es_win):
                     time.sleep(2)
@@ -152,34 +153,38 @@ def run_bot():
                 elif ef_win < es_win:
                     side = "sell"
 
-                if side is None:
-                    time.sleep(2)
-                    continue
+                if side:
+                    in_position = True
+                    last_trade_candle = current_candle
 
-                ensure_leverage(SYMBOL, LEVERAGE)
-                px_now = latest_price(SYMBOL)
-                order = place_market(SYMBOL, side, LOT_SIZE)
-                avg = order.get("average") or order.get("price") or px_now
-                entry_price = float(avg)
-                entry_side = side
-                in_position = True
-                log(f"ENTRY {side.upper()} @ {entry_price}")
+                    try:
+                        ensure_leverage(SYMBOL, LEVERAGE)
+                        px_now = latest_price(SYMBOL)
+                        order = place_market(SYMBOL, side, LOT_SIZE)
+                        avg = order.get("average") or order.get("price") or px_now
+                        entry_price = float(avg)
+                        entry_side = side
+                        log(f"ENTRY {side.upper()} @ {entry_price}")
 
-                if side == "buy":
-                    tp_price = entry_price + TP_POINTS
-                    sl_price = entry_price - SL_POINTS
-                else:
-                    tp_price = entry_price - TP_POINTS
-                    sl_price = entry_price + SL_POINTS
+                        if side == "buy":
+                            tp_price = entry_price + TP_POINTS
+                            sl_price = entry_price - SL_POINTS
+                        else:
+                            tp_price = entry_price - TP_POINTS
+                            sl_price = entry_price + SL_POINTS
 
-                sl_o, tp_o = place_sl_tp_reduce_only(SYMBOL, side, LOT_SIZE, sl_price, tp_price)
-                sl_order_id = sl_o.get("id")
-                tp_order_id = tp_o.get("id")
-                log(f"Placed exits: TP @ {tp_price} | SL @ {sl_price}")
+                        sl_o, tp_o = place_sl_tp_reduce_only(SYMBOL, side, LOT_SIZE, sl_price, tp_price)
+                        sl_order_id = sl_o.get("id")
+                        tp_order_id = tp_o.get("id")
+                        log(f"Placed exits: TP @ {tp_price} | SL @ {sl_price}")
+                    except Exception as e:
+                        log("Order failed:", repr(e))
+                        in_position = False   # unlock if fail
 
+            # --- EXIT LOGIC ---
             else:
                 qty = position_size(SYMBOL)
-                if qty == 0.0:
+                if qty == 0.0 and in_position:
                     tp_order = fetch_order_safe(tp_order_id, SYMBOL) if tp_order_id else None
                     sl_order = fetch_order_safe(sl_order_id, SYMBOL) if sl_order_id else None
 
