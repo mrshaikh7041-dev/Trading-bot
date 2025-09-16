@@ -2,6 +2,7 @@ import ccxt
 import pandas as pd
 import time
 from datetime import datetime
+import os
 
 # ---------------- CONFIG ----------------
 SYMBOL = "ETH/USDT"
@@ -11,19 +12,16 @@ EMA_SLOW = 55
 LOT_SIZE = 0.01
 TP_POINTS = 30
 SL_POINTS = 40
-FEE_RATE = 0.0006        # 0.06%
-START_BALANCE = 4.0      # starting balance in USDT
+FEE_RATE = 0.0006
+START_BALANCE = 4.0
 LEVERAGE = 100
 CANDLE_LIMIT = 50
-SLIPPAGE_RATE = 0.0002    # 0.02% simulated slippage
-COOLDOWN_AFTER_1_SL = 30  # candles
-POLL_SLEEP = 1            # seconds between polls
+SLIPPAGE_RATE = 0.0002
+COOLDOWN_AFTER_1_SL = 30
+POLL_SLEEP = 1
 
 # ---------------- EXCHANGE ----------------
-exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {"defaultType": "future", "adjustForTimeDifference": True}
-})
+exchange = ccxt.binance({'enableRateLimit': True})
 
 # ---------------- HELPERS ----------------
 def nowstr():
@@ -42,18 +40,17 @@ def fetch_candles(symbol, tf=TIMEFRAME, limit=CANDLE_LIMIT):
 # ---------------- MAIN BOT ----------------
 def run_paper_bot():
     balance = START_BALANCE
-    sl_count = 0
     cooldown = 0
-
-    active_trades = []   # open virtual trades
-    trade_history = []   # closed trades summary
-    prev_candle = None
+    in_position = False
+    entry_side = None
+    entry_price = None
+    last_trade_candle = None
 
     log(f"🚀 Starting PAPER BOT | Balance: {balance} USDT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
 
     while True:
         try:
-            df = fetch_candles(SYMBOL, TIMEFRAME, limit=CANDLE_LIMIT)
+            df = fetch_candles(SYMBOL)
             df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
             df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
             df["ema_fast_window"] = df["ema_fast"].rolling(window=CANDLE_LIMIT).mean()
@@ -65,16 +62,14 @@ def run_paper_bot():
             price = df["close"].iloc[-1]
 
             # cooldown decrement
-            if prev_candle is None:
-                prev_candle = current_candle
-            elif current_candle != prev_candle:
-                if cooldown > 0:
-                    cooldown -= 1
-                    log(f"Cooldown active -> {cooldown} candles remaining")
-                prev_candle = current_candle
+            if cooldown > 0:
+                cooldown -= 1
+                log(f"Cooldown active: {cooldown} candles remaining")
+                time.sleep(POLL_SLEEP)
+                continue
 
             # ---------- ENTRY ----------
-            if cooldown == 0:
+            if not in_position and current_candle != last_trade_candle:
                 side = None
                 if ef_win > es_win:
                     side = "buy"
@@ -82,92 +77,61 @@ def run_paper_bot():
                     side = "sell"
 
                 if side:
-                    # simulate slippage
-                    if side == "buy":
-                        entry_price = price * (1 + SLIPPAGE_RATE)
-                        tp_price = entry_price + TP_POINTS
-                        sl_price = entry_price - SL_POINTS
-                    else:
-                        entry_price = price * (1 - SLIPPAGE_RATE)
-                        tp_price = entry_price - TP_POINTS
-                        sl_price = entry_price + SL_POINTS
+                    last_trade_candle = current_candle
+                    in_position = True
+                    entry_side = side
+                    entry_price = price * (1 + SLIPPAGE_RATE if side=="buy" else 1 - SLIPPAGE_RATE)
 
-                    trade = {
-                        "entry_time": current_candle,
-                        "side": side,
-                        "entry_price": entry_price,
-                        "tp_price": tp_price,
-                        "sl_price": sl_price,
-                        "closed": False
-                    }
-                    active_trades.append(trade)
-                    log(f"[ENTRY {side.upper()}] @ {round(entry_price,6)} | TP: {round(tp_price,6)} | SL: {round(sl_price,6)} | Balance: {round(balance,6)}")
+                    # TP/SL calculation
+                    tp_price = entry_price + TP_POINTS if side=="buy" else entry_price - TP_POINTS
+                    sl_price = entry_price - SL_POINTS if side=="buy" else entry_price + SL_POINTS
 
-            # ---------- MONITOR / EXIT ----------
-            if active_trades:
-                to_remove = []
-                for t in active_trades:
-                    h, l = df["high"].iloc[-1], df["low"].iloc[-1]
-                    hit = None
-                    if t["side"] == "buy":
-                        if h >= t["tp_price"]:
-                            hit = ("TP", t["tp_price"])
-                        elif l <= t["sl_price"]:
-                            hit = ("SL", t["sl_price"])
-                    else:
-                        if l <= t["tp_price"]:
-                            hit = ("TP", t["tp_price"])
-                        elif h >= t["sl_price"]:
-                            hit = ("SL", t["sl_price"])
+                    log(f"[ENTRY {side.upper()}] @ {round(entry_price,6)} | TP: {round(tp_price,6)} | SL: {round(sl_price,6)}")
 
-                    if hit:
-                        outcome, exit_price = hit
-                        pnl = (exit_price - t["entry_price"]) * LOT_SIZE if t["side"]=="buy" else (t["entry_price"] - exit_price) * LOT_SIZE
-                        fee = t["entry_price"] * LOT_SIZE * FEE_RATE * 2
-                        pnl -= fee
-                        balance += pnl
+            # ---------- EXIT LOGIC ----------
+            elif in_position:
+                # simulate TP/SL hit by candle high/low
+                high = df["high"].iloc[-1]
+                low = df["low"].iloc[-1]
+                outcome = None
+                exit_price = None
 
-                        trade_history.append({
-                            "entry_time": t["entry_time"],
-                            "side": t["side"],
-                            "entry": t["entry_price"],
-                            "exit": exit_price,
-                            "outcome": outcome,
-                            "pnl": round(pnl,6),
-                            "balance": round(balance,6)
-                        })
+                if entry_side=="buy":
+                    if high >= tp_price:
+                        outcome = "TP"
+                        exit_price = tp_price
+                    elif low <= sl_price:
+                        outcome = "SL"
+                        exit_price = sl_price
+                else:
+                    if low <= tp_price:
+                        outcome = "TP"
+                        exit_price = tp_price
+                    elif high >= sl_price:
+                        outcome = "SL"
+                        exit_price = sl_price
 
-                        log(f"[EXIT {outcome}] {t['side'].upper()} | Entry: {round(t['entry_price'],6)} Exit: {round(exit_price,6)} | PnL: {round(pnl,6)} | Balance: {round(balance,6)}")
+                if outcome:
+                    pnl = (exit_price - entry_price) * LOT_SIZE if entry_side=="buy" else (entry_price - exit_price) * LOT_SIZE
+                    fee = LOT_SIZE * entry_price * FEE_RATE * 2
+                    pnl -= fee
+                    balance += pnl
 
-                        if outcome=="SL":
-                            sl_count += 1
-                            if sl_count >= 1:
-                                cooldown = COOLDOWN_AFTER_1_SL
-                                sl_count = 0
-                                log(f"SL hit -> cooldown {COOLDOWN_AFTER_1_SL} candles")
-                        else:
-                            sl_count = 0
+                    log(f"[EXIT {outcome}] @ {round(exit_price,6)} | PnL: {round(pnl,6)} | Balance: {round(balance,6)}")
 
-                        to_remove.append(t)
-
-                # remove closed trades
-                for r in to_remove:
-                    try:
-                        active_trades.remove(r)
-                    except ValueError:
-                        pass
+                    if outcome=="SL":
+                        cooldown = COOLDOWN_AFTER_1_SL
+                        log(f"SL hit -> cooldown {COOLDOWN_AFTER_1_SL} candles")
+                    
+                    in_position = False
+                    entry_side = None
+                    entry_price = None
 
             time.sleep(POLL_SLEEP)
 
         except KeyboardInterrupt:
-            log("Interrupted by user. Final summary:")
-            total = len(trade_history)
-            wins = sum(1 for x in trade_history if x["outcome"]=="TP")
-            total_pnl = sum(x["pnl"] for x in trade_history)
-            win_rate = (wins/total*100) if total>0 else 0
-            log(f"Trades: {total} | Wins: {wins} | Win%: {round(win_rate,2)} | Net PnL: {round(total_pnl,6)} | Final Balance: {round(balance,6)}")
+            log("Bot stopped by user.")
             break
-
         except Exception as e:
             log("ERROR:", repr(e))
             time.sleep(2)
