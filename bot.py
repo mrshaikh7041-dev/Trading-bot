@@ -162,6 +162,13 @@ def run_paper_bot():
             time.sleep(2)
             continue
 
-# -------- RUN --------
+# -------- AUTO-RESTART WRAPPER --------
 if __name__ == "__main__":
-    run_paper_bot()
+    while True:
+        try:
+            run_paper_bot()
+        except Exception as e:
+            log("BOT CRASHED:", repr(e))
+            log("Restarting bot in 5 seconds...")
+            time.sleep(5)
+            continue
