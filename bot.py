@@ -7,162 +7,166 @@ from datetime import datetime, timedelta
 # ---------------- CONFIG ----------------
 SYMBOL = "ETH/USDT"
 TIMEFRAME = "1m"
-EMA_FAST = 13
-EMA_SLOW = 55
 LOT_SIZE = 0.02
 TP_POINTS = 40
 SL_POINTS = 20
-START_BALANCE = 3.0
-LEVERAGE = 100               # only for margin check
-COOLDOWN_AFTER_SL = 30       # minutes
-POLL_SLEEP = 1               # seconds
+LEVERAGE = 100
+COOLDOWN_MINUTES = 30
+EMA_FAST = 13
+EMA_SLOW = 55
 SLOPE_WINDOW = 3
 SLOPE_DEG = 20
+POLL_SLEEP = 1  # seconds between fetching new candles
 
-# ---------------- EXCHANGE ----------------
 exchange = ccxt.binance({'enableRateLimit': True})
 
-# ---------------- HELPERS ----------------
+# -------- Candle pattern --------
+def is_strong_bullish(o,h,l,c):
+    body = c - o
+    rng = h - l if h-l!=0 else 1e-9
+    upper_wick = h - c
+    lower_wick = o - l
+    if body>0 and (body/rng)>=0.55: return True
+    if body>0 and (lower_wick >= 2*abs(body)) and (upper_wick <= abs(body)*0.5): return True
+    if body>0 and ((c-l)/rng)>=0.75: return True
+    return False
+
+def is_strong_bearish(o,h,l,c):
+    body = c - o
+    rng = h - l if h-l!=0 else 1e-9
+    upper_wick = h - o
+    lower_wick = c - l
+    if body<0 and (abs(body)/rng)>=0.55: return True
+    if body<0 and (upper_wick >= 2*abs(body)) and (lower_wick <= abs(body)*0.5): return True
+    if body<0 and ((h-c)/rng)>=0.75: return True
+    return False
+
+# -------- Helpers --------
 def nowstr():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 def log(*args):
     print(nowstr(), *args, flush=True)
 
-def fetch_candles(symbol, tf=TIMEFRAME, limit=50):
+def fetch_candles(symbol, tf=TIMEFRAME, limit=100):
     ohlc = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df = pd.DataFrame(ohlc, columns=["ts","open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["ts"], unit="ms")
-    df.set_index("time", inplace=True)
+    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
     return df
 
-# EMA slope calculation
-def ema_slope(df, ema_col, window):
-    if len(df) < window + 1:
-        return 0
-    delta_y = df[ema_col].iloc[-1] - df[ema_col].iloc[-window-1]
-    slope_deg = abs(math.degrees(math.atan(delta_y / window)))
-    return slope_deg
-
-# Candle check
-def is_bullish(o,h,l,c):
-    body = c - o
-    rng = h - l if h-l !=0 else 1e-9
-    if body>0 and (body/rng)>=0.55:
-        return True
-    return False
-
-def is_bearish(o,h,l,c):
-    body = c - o
-    rng = h - l if h-l !=0 else 1e-9
-    if body<0 and (abs(body)/rng)>=0.55:
-        return True
-    return False
-
-# ---------------- BOT ----------------
+# -------- Bot --------
 def run_paper_bot():
-    balance = START_BALANCE
-    cooldown_until = None
+    balance = 3.0
     in_position = False
-    entry_side = None
-    entry_price = None
-    tp_price = None
-    sl_price = None
-    last_trade_candle = None
+    cooldown_until = None
+    last_trend, crossover_idx, last_tp_candle_close = None, None, None
 
-    daily_trades = 0
-    daily_tp = 0
-    daily_sl = 0
-    current_day = None
-
-    log(f"🚀 Starting PAPER BOT | Balance: {balance} USDT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
+    log(f"🚀 Starting LIVE PAPER BOT | Balance: {balance} USDT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
 
     while True:
         try:
-            df = fetch_candles(SYMBOL, limit=50)
-            df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-            df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+            df = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
+            df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+            df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
 
-            current_candle = df.index[-1]
-            o,h,l,c = df.iloc[-1][['open','high','low','close']]
+            for i in range(max(EMA_SLOW, SLOPE_WINDOW), len(df)):
+                time_now = df.loc[i,'time']
+                o,h,l,c = df.loc[i,['open','high','low','close']]
+                emaF, emaS = df.loc[i,'ema_fast'], df.loc[i,'ema_slow']
 
-            # reset daily counters
-            if current_day != df.index[-1].date():
-                if current_day is not None:
-                    log(f"📊 DAILY SUMMARY | Trades: {daily_trades} | TP: {daily_tp} | SL: {daily_sl} | Balance: {round(balance,6)} USDT")
-                current_day = df.index[-1].date()
-                daily_trades = 0
-                daily_tp = 0
-                daily_sl = 0
+                if cooldown_until and datetime.utcnow() < cooldown_until:
+                    continue
 
-            # cooldown check
-            if cooldown_until and datetime.utcnow() < cooldown_until:
-                time.sleep(POLL_SLEEP)
-                continue
+                emaF_prev, emaS_prev = df.loc[i-1,'ema_fast'], df.loc[i-1,'ema_slow']
+                bullish_cross = (emaF_prev <= emaS_prev) and (emaF > emaS)
+                bearish_cross = (emaF_prev >= emaS_prev) and (emaF < emaS)
 
-            # Entry logic
-            if not in_position and current_candle != last_trade_candle:
-                last_trade_candle = current_candle
-                bullish_cross = (df["ema_fast"].iloc[-2] <= df["ema_slow"].iloc[-2]) and (df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1])
-                bearish_cross = (df["ema_fast"].iloc[-2] >= df["ema_slow"].iloc[-2]) and (df["ema_fast"].iloc[-1] < df["ema_slow"].iloc[-1])
+                # slope
+                emaF_past = df.loc[i-SLOPE_WINDOW,'ema_fast']
+                slope_deg = abs(math.degrees(math.atan((emaF - emaF_past)/SLOPE_WINDOW)))
+                slope_ok = slope_deg >= SLOPE_DEG
 
-                slope = ema_slope(df,"ema_fast",SLOPE_WINDOW)
-                if slope < SLOPE_DEG:
-                    bullish_cross = bearish_cross = False
+                if bullish_cross and slope_ok:
+                    last_trend, crossover_idx = "BUY", i
+                elif bearish_cross and slope_ok:
+                    last_trend, crossover_idx = "SELL", i
 
-                side = None
-                if bullish_cross and is_bullish(o,h,l,c):
-                    side = "BUY"
-                elif bearish_cross and is_bearish(o,h,l,c):
-                    side = "SELL"
+                if crossover_idx is not None and crossover_idx < i:
+                    if last_trend=="BUY" and not (emaF>emaS):
+                        last_trend, crossover_idx = None, None
+                    elif last_trend=="SELL" and not (emaF<emaS):
+                        last_trend, crossover_idx = None, None
 
-                if side:
-                    # check margin
-                    notional = c * LOT_SIZE
+                if in_position:
+                    continue
+
+                if last_tp_candle_close is not None:
+                    if last_trend=="BUY" and not (last_tp_candle_close>emaF and last_tp_candle_close>emaS):
+                        last_tp_candle_close, last_trend, crossover_idx = None, None, None
+                        continue
+                    if last_trend=="SELL" and not (last_tp_candle_close<emaF and last_tp_candle_close<emaS):
+                        last_tp_candle_close, last_trend, crossover_idx = None, None, None
+                        continue
+                    last_tp_candle_close = None
+
+                if crossover_idx is not None and last_trend in ("BUY","SELL"):
+                    touches_emaF = (l <= emaF <= h)
+                    if not touches_emaF:
+                        continue
+
+                    if last_trend=="BUY": is_alert = is_strong_bullish(o,h,l,c)
+                    else: is_alert = is_strong_bearish(o,h,l,c)
+                    if not is_alert:
+                        continue
+
+                    # ENTRY at next candle open
+                    entry_idx = i+1 if i+1<len(df) else i
+                    entry_price = df.loc[entry_idx,'open']
+                    direction = last_trend
+
+                    # margin check
+                    notional = entry_price * LOT_SIZE
                     required_margin = notional / LEVERAGE
                     if balance < required_margin:
-                        log(f"❌ Insufficient balance {balance} USDT for {side} at {c}, stopping bot.")
+                        log(f"❌ Insufficient balance for {direction} at {entry_price}")
                         break
 
-                    entry_side = side
-                    entry_price = c
-                    tp_price = entry_price + TP_POINTS if side=="BUY" else entry_price - TP_POINTS
-                    sl_price = entry_price - SL_POINTS if side=="BUY" else entry_price + SL_POINTS
+                    tp_price = entry_price + TP_POINTS if direction=="BUY" else entry_price - TP_POINTS
+                    sl_price = entry_price - SL_POINTS if direction=="BUY" else entry_price + SL_POINTS
                     in_position = True
-                    log(f"[ENTRY {side}] @ {round(entry_price,6)} | TP: {round(tp_price,6)} | SL: {round(sl_price,6)}")
 
-            # Exit logic
-            if in_position:
-                outcome = None
-                exit_price = None
-                if entry_side=="BUY":
-                    if h >= tp_price:
-                        outcome = "TP"
-                        exit_price = tp_price
-                    elif l <= sl_price:
-                        outcome = "SL"
-                        exit_price = sl_price
-                else:
-                    if l <= tp_price:
-                        outcome = "TP"
-                        exit_price = tp_price
-                    elif h >= sl_price:
-                        outcome = "SL"
-                        exit_price = sl_price
+                    # Live candle TP/SL check
+                    while in_position:
+                        df_new = fetch_candles(SYMBOL, TIMEFRAME, limit=2)
+                        o2,h2,l2,c2 = df_new.iloc[-1][['open','high','low','close']]
+                        if direction=="BUY":
+                            if h2 >= tp_price:
+                                pnl = (tp_price - entry_price) * LOT_SIZE
+                                outcome = "TP"
+                                in_position = False
+                            elif l2 <= sl_price:
+                                pnl = (sl_price - entry_price) * LOT_SIZE * -1
+                                outcome = "SL"
+                                in_position = False
+                        else:
+                            if l2 <= tp_price:
+                                pnl = (entry_price - tp_price) * LOT_SIZE
+                                outcome = "TP"
+                                in_position = False
+                            elif h2 >= sl_price:
+                                pnl = (entry_price - sl_price) * LOT_SIZE * -1
+                                outcome = "SL"
+                                in_position = False
 
-                if outcome:
-                    pnl = (exit_price - entry_price) * LOT_SIZE if entry_side=="BUY" else (entry_price - exit_price) * LOT_SIZE
-                    balance += pnl
-                    daily_trades += 1
-                    if outcome=="TP":
-                        daily_tp +=1
-                    else:
-                        daily_sl +=1
-                        cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_AFTER_SL)
-
-                    log(f"[EXIT {outcome}] @ {round(exit_price,6)} | PnL: {round(pnl,6)} | Balance: {round(balance,6)}")
-                    in_position = False
-                    entry_side = entry_price = tp_price = sl_price = None
+                        if not in_position:
+                            balance += pnl
+                            log(f"[{direction} ENTRY @ {entry_price}] -> EXIT {outcome} @ {tp_price if outcome=='TP' else sl_price} | PnL: {pnl} | Balance: {balance}")
+                            if outcome=="SL":
+                                cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
+                                last_trend, crossover_idx = None, None
+                            else:
+                                last_tp_candle_close = c2
+                        time.sleep(POLL_SLEEP)
 
             time.sleep(POLL_SLEEP)
 
@@ -174,6 +178,6 @@ def run_paper_bot():
             time.sleep(2)
             continue
 
-# ---------------- RUN ----------------
+# -------- RUN --------
 if __name__ == "__main__":
     run_paper_bot()
