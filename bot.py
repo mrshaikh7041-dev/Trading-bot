@@ -17,6 +17,7 @@ EMA_SLOW = 55
 SLOPE_WINDOW = 3
 SLOPE_DEG = 20
 POLL_SLEEP = 1  # seconds
+STARTING_BALANCE = 3.0  # Paper trading starting balance
 
 # ---------------- EXCHANGE ----------------
 exchange = ccxt.binance({'enableRateLimit': True})
@@ -51,11 +52,12 @@ def fetch_candles(symbol, tf=TIMEFRAME, limit=200):
 
 # -------- Paper Trading Bot --------
 def run_paper_bot():
+    balance = STARTING_BALANCE
     in_position = False
     cooldown_until = None
     last_trend, crossover_idx, last_tp_candle_close = None, None, None
 
-    log(f"🚀 Starting IMPROVED PAPER BOT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
+    log(f"🚀 Starting PAPER BOT | Starting Balance: {balance} USDT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
 
     while True:
         try:
@@ -63,7 +65,6 @@ def run_paper_bot():
             df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
             df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
 
-            # get last closed candle for polling sync
             last_candle = df.iloc[-2]
             o,h,l,c = last_candle[['open','high','low','close']]
             emaF, emaS = last_candle['ema_fast'], last_candle['ema_slow']
@@ -103,13 +104,13 @@ def run_paper_bot():
             entry_price = entry_candle['open']
             direction = last_trend
 
-            # Paper trade: check balance + log
-            balance = 1000  # simulate starting balance
+            # Margin check simulated
             notional = entry_price * LOT_SIZE
             required_margin = notional / LEVERAGE
             if balance < required_margin:
                 log(f"❌ Insufficient balance for {direction} at {entry_price}")
-                break
+                time.sleep(POLL_SLEEP)
+                continue
 
             log(f"[ENTRY {direction}] @ {round(entry_price,6)} | TP: {TP_POINTS} | SL: {SL_POINTS}")
             in_position = True
@@ -118,32 +119,39 @@ def run_paper_bot():
             while in_position:
                 df_new = fetch_candles(SYMBOL, TIMEFRAME, limit=2)
                 o2,h2,l2,c2 = df_new.iloc[-1][['open','high','low','close']]
+
                 if direction=="BUY":
                     if h2 >= entry_price + TP_POINTS:
                         outcome = "TP"
-                        in_position = False
                         exit_price = entry_price + TP_POINTS
+                        pnl = (exit_price - entry_price) * LOT_SIZE
+                        in_position = False
                     elif l2 <= entry_price - SL_POINTS:
                         outcome = "SL"
-                        in_position = False
                         exit_price = entry_price - SL_POINTS
+                        pnl = (exit_price - entry_price) * LOT_SIZE
+                        in_position = False
                 else:
                     if l2 <= entry_price - TP_POINTS:
                         outcome = "TP"
-                        in_position = False
                         exit_price = entry_price - TP_POINTS
+                        pnl = (entry_price - exit_price) * LOT_SIZE
+                        in_position = False
                     elif h2 >= entry_price + SL_POINTS:
                         outcome = "SL"
-                        in_position = False
                         exit_price = entry_price + SL_POINTS
+                        pnl = (entry_price - exit_price) * LOT_SIZE
+                        in_position = False
 
                 if not in_position:
-                    log(f"[EXIT {outcome}] @ {round(exit_price,6)} | Direction: {direction}")
+                    balance += pnl
+                    log(f"[EXIT {outcome}] @ {round(exit_price,6)} | PnL: {round(pnl,6)} | Balance: {round(balance,6)}")
                     if outcome=="SL":
                         cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
                         last_trend = None
                     else:
                         last_tp_candle_close = c2
+
                 time.sleep(POLL_SLEEP)
 
         except KeyboardInterrupt:
