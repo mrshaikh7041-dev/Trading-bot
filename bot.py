@@ -6,6 +6,12 @@ import os
 from datetime import datetime, timedelta
 
 # ---------------- CONFIG ----------------
+API_KEY    = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+
+if not API_KEY or not API_SECRET:
+    raise SystemExit("❌ API_KEY / API_SECRET missing! Set them in AWS environment variables.")
+    
 SYMBOL = "ETH/USDT"
 TIMEFRAME = "1m"
 LOT_SIZE = 0.02
@@ -20,11 +26,15 @@ SLOPE_DEG = 20
 POLL_SLEEP = 1  # seconds
 
 # ---------------- EXCHANGE ----------------
-API_KEY    = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+exchange = ccxt.binance({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
+    "enableRateLimit": True,
+    "options": {"defaultType": "future", "adjustForTimeDifference": True}
+})
 
-if not API_KEY or not API_SECRET:
-    raise SystemExit("❌ API_KEY / API_SECRET missing! Set them in AWS environment variables.")
+def log(*args):
+    print(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), *args, flush=True
 
 # -------- Candle pattern --------
 def is_strong_bullish(o,h,l,c):
