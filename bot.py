@@ -180,7 +180,7 @@ def run_live_bot():
 if __name__ == "__main__":
     while True:  # AWS auto-restart loop
         try:
-            run_bot()
+            run_live_bot()
         except Exception as e:
             log("BOT CRASHED:", repr(e))
             log("Restarting in 5 seconds...")
