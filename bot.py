@@ -1,28 +1,119 @@
+import os
+import time
 import ccxt
 import pandas as pd
 import math
-import time
 from datetime import datetime, timedelta
 
-# ---------------- CONFIG ----------------
-SYMBOL = "ETH/USDT"
-TIMEFRAME = "1m"
-LOT_SIZE = 0.02
-TP_POINTS = 40
-SL_POINTS = 20
-LEVERAGE = 100
-COOLDOWN_MINUTES = 30
-EMA_FAST = 13
-EMA_SLOW = 55
-SLOPE_WINDOW = 3
-SLOPE_DEG = 20
-POLL_SLEEP = 1  # seconds
-STARTING_BALANCE = 3.0  # Paper trading starting balance
+# ----------------- CONFIG -----------------
+API_KEY    = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
 
-# ---------------- EXCHANGE ----------------
-exchange = ccxt.binance({'enableRateLimit': True})
+if not API_KEY or not API_SECRET:
+    raise SystemExit("❌ API_KEY / API_SECRET missing! Set them in AWS environment variables.")
 
-# -------- Candle pattern --------
+SYMBOL            = "ETH/USDT"
+TIMEFRAME         = "1m"
+LOT_SIZE          = 0.02       # from paper bot
+TP_POINTS         = 40.0       # from paper bot
+SL_POINTS         = 20.0       # from paper bot
+LEVERAGE          = 100
+EMA_FAST          = 13
+EMA_SLOW          = 55
+SLOPE_WINDOW      = 3
+SLOPE_DEG         = 20
+COOLDOWN_MINUTES  = 30
+WORKING_TYPE      = "MARK_PRICE"
+CANDLE_LIMIT      = 200
+
+# ----------------- EXCHANGE -----------------
+exchange = ccxt.binance({
+    "apiKey": API_KEY,
+    "secret": API_SECRET,
+    "enableRateLimit": True,
+    "options": {"defaultType": "future", "adjustForTimeDifference": True}
+})
+
+def log(*args):
+    print(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), *args, flush=True)
+
+# ----------------- HELPERS -----------------
+def show_balance():
+    try:
+        balance = exchange.fetch_balance({"type": "future"})
+        usdt = balance['total'].get('USDT', 0)
+        log(f"Connected ✅ Futures Balance: {usdt} USDT")
+    except Exception as e:
+        log("Balance fetch error:", repr(e))
+
+def ensure_leverage(sym, lev):
+    try:
+        exchange.set_leverage(int(lev), sym)
+    except Exception:
+        mkt = exchange.market(sym)['id']
+        exchange.fapiPrivate_post_leverage({"symbol": mkt, "leverage": int(lev)})
+    log(f"Leverage ensured: {lev}x for {sym}")
+
+def fetch_ema_df(sym, tf=TIMEFRAME, limit=CANDLE_LIMIT):
+    ohlc = exchange.fetch_ohlcv(sym, timeframe=tf, limit=limit)
+    df = pd.DataFrame(ohlc, columns=["ts","open","high","low","close","volume"])
+    df["time"] = pd.to_datetime(df["ts"], unit="ms")
+    df.set_index("time", inplace=True)
+    df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    return df
+
+def latest_price(sym):
+    return float(exchange.fetch_ticker(sym)["last"])
+
+def place_market(sym, side, qty):
+    return exchange.create_order(sym, type="market", side=side, amount=qty)
+
+def place_sl_tp_reduce_only(sym, side, qty, sl_price, tp_price):
+    params_common = {"reduceOnly": True, "positionSide": "BOTH", "workingType": WORKING_TYPE}
+    close_side = "sell" if side == "buy" else "buy"
+
+    sl_order = exchange.create_order(
+        sym, "STOP_MARKET", close_side, qty,
+        params={**params_common, "stopPrice": float(sl_price)}
+    )
+    tp_order = exchange.create_order(
+        sym, "TAKE_PROFIT_MARKET", close_side, qty,
+        params={**params_common, "stopPrice": float(tp_price)}
+    )
+    return sl_order, tp_order
+
+def fetch_order_safe(order_id, sym):
+    try:
+        return exchange.fetch_order(order_id, sym)
+    except Exception:
+        return None
+
+def position_size(sym):
+    try:
+        positions = exchange.fetch_positions([sym])
+        for p in positions:
+            if p.get("symbol") == sym or p.get("info", {}).get("symbol") == sym.replace("/", ""):
+                amt = float(p.get("contracts") or p.get("info", {}).get("positionAmt") or 0)
+                return abs(amt)
+    except Exception:
+        pass
+    return 0.0
+
+def cancel_open_reduce_only(sym):
+    try:
+        open_orders = exchange.fetch_open_orders(sym)
+        for o in open_orders:
+            info = o.get("info", {}) or {}
+            if info.get("reduceOnly") or o.get("reduceOnly"):
+                try:
+                    exchange.cancel_order(o["id"], sym)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+# -------- Candle pattern check --------
 def is_strong_bullish(o,h,l,c):
     body = c - o
     rng = h-l if h-l!=0 else 1e-9
@@ -37,138 +128,119 @@ def is_strong_bearish(o,h,l,c):
     lower_wick = c - l
     return (body<0 and abs(body)/rng>=0.55) or (body<0 and upper_wick>=2*abs(body) and lower_wick<=abs(body)*0.5) or (body<0 and (h-c)/rng>=0.75)
 
-# -------- Helpers --------
-def nowstr():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+# ----------------- MAIN BOT LOOP -----------------
+def run_bot():
+    show_balance()
+    ensure_leverage(SYMBOL, LEVERAGE)
+    log(f"🚀 Starting Futures Bot | Symbol: {SYMBOL} | Leverage: {LEVERAGE}x | Lot: {LOT_SIZE}")
 
-def log(*args):
-    print(nowstr(), *args, flush=True)
-
-def fetch_candles(symbol, tf=TIMEFRAME, limit=200):
-    ohlc = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    return df
-
-# -------- Paper Trading Bot --------
-def run_paper_bot():
-    balance = STARTING_BALANCE
     in_position = False
+    entry_side = None
+    entry_price = None
+    tp_order_id = None
+    sl_order_id = None
     cooldown_until = None
-    last_trend, crossover_idx, last_tp_candle_close = None, None, None
-
-    log(f"🚀 Starting PAPER BOT | Starting Balance: {balance} USDT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
 
     while True:
         try:
-            df = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
-            df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
-            df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+            df = fetch_ema_df(SYMBOL, TIMEFRAME, limit=CANDLE_LIMIT)
 
             last_candle = df.iloc[-2]
             o,h,l,c = last_candle[['open','high','low','close']]
             emaF, emaS = last_candle['ema_fast'], last_candle['ema_slow']
+            emaF_prev, emaS_prev = df.iloc[-3]['ema_fast'], df.iloc[-3]['ema_slow']
 
+            # cooldown check
             if cooldown_until and datetime.utcnow() < cooldown_until:
-                time.sleep(POLL_SLEEP)
+                log(f"⏸️ Cooldown active until {cooldown_until}")
+                time.sleep(60)
                 continue
 
-            emaF_prev, emaS_prev = df.iloc[-3]['ema_fast'], df.iloc[-3]['ema_slow']
-            bullish_cross = (emaF_prev <= emaS_prev) and (emaF > emaS)
-            bearish_cross = (emaF_prev >= emaS_prev) and (emaF < emaS)
-
-            # slope
+            # slope check
             emaF_past = df.iloc[-1-SLOPE_WINDOW]['ema_fast']
             slope_deg = abs(math.degrees(math.atan((emaF - emaF_past)/SLOPE_WINDOW)))
             slope_ok = slope_deg >= SLOPE_DEG
 
-            if bullish_cross and slope_ok:
-                last_trend, crossover_idx = "BUY", df.index[-2]
-            elif bearish_cross and slope_ok:
-                last_trend, crossover_idx = "SELL", df.index[-2]
+            bullish_cross = (emaF_prev <= emaS_prev) and (emaF > emaS) and slope_ok
+            bearish_cross = (emaF_prev >= emaS_prev) and (emaF < emaS) and slope_ok
 
-            if in_position or last_trend is None:
-                time.sleep(POLL_SLEEP)
-                continue
+            side = None
+            if bullish_cross and is_strong_bullish(o,h,l,c):
+                side = "buy"
+            elif bearish_cross and is_strong_bearish(o,h,l,c):
+                side = "sell"
 
-            # Check strong candle at last closed candle
-            if last_trend=="BUY" and not is_strong_bullish(o,h,l,c):
-                time.sleep(POLL_SLEEP)
-                continue
-            if last_trend=="SELL" and not is_strong_bearish(o,h,l,c):
-                time.sleep(POLL_SLEEP)
-                continue
+            # --- ENTRY LOGIC ---
+            if not in_position and side:
+                ensure_leverage(SYMBOL, LEVERAGE)
+                px_now = latest_price(SYMBOL)
+                order = place_market(SYMBOL, side, LOT_SIZE)
+                avg = order.get("average") or order.get("price") or px_now
+                entry_price = float(avg)
+                entry_side = side
+                in_position = True
+                log(f"[ENTRY {side.upper()}] @ {entry_price}")
 
-            # Entry at current candle open
-            entry_candle = df.iloc[-1]
-            entry_price = entry_candle['open']
-            direction = last_trend
-
-            # Margin check simulated
-            notional = entry_price * LOT_SIZE
-            required_margin = notional / LEVERAGE
-            if balance < required_margin:
-                log(f"❌ Insufficient balance for {direction} at {entry_price}")
-                time.sleep(POLL_SLEEP)
-                continue
-
-            log(f"[ENTRY {direction}] @ {round(entry_price,6)} | TP: {TP_POINTS} | SL: {SL_POINTS}")
-            in_position = True
-
-            # Monitor TP/SL
-            while in_position:
-                df_new = fetch_candles(SYMBOL, TIMEFRAME, limit=2)
-                o2,h2,l2,c2 = df_new.iloc[-1][['open','high','low','close']]
-
-                if direction=="BUY":
-                    if h2 >= entry_price + TP_POINTS:
-                        outcome = "TP"
-                        exit_price = entry_price + TP_POINTS
-                        pnl = (exit_price - entry_price) * LOT_SIZE
-                        in_position = False
-                    elif l2 <= entry_price - SL_POINTS:
-                        outcome = "SL"
-                        exit_price = entry_price - SL_POINTS
-                        pnl = (exit_price - entry_price) * LOT_SIZE
-                        in_position = False
+                if side == "buy":
+                    tp_price = entry_price + TP_POINTS
+                    sl_price = entry_price - SL_POINTS
                 else:
-                    if l2 <= entry_price - TP_POINTS:
+                    tp_price = entry_price - TP_POINTS
+                    sl_price = entry_price + SL_POINTS
+
+                sl_o, tp_o = place_sl_tp_reduce_only(SYMBOL, side, LOT_SIZE, sl_price, tp_price)
+                sl_order_id = sl_o.get("id")
+                tp_order_id = tp_o.get("id")
+                log(f"Placed exits: TP @ {tp_price} | SL @ {sl_price}")
+
+            # --- EXIT LOGIC ---
+            elif in_position:
+                qty = position_size(SYMBOL)
+                if qty == 0.0:
+                    tp_order = fetch_order_safe(tp_order_id, SYMBOL) if tp_order_id else None
+                    sl_order = fetch_order_safe(sl_order_id, SYMBOL) if sl_order_id else None
+
+                    outcome = "UNKNOWN"
+                    exit_price = latest_price(SYMBOL)
+
+                    if tp_order and str(tp_order.get("status","")).lower() in ["closed","filled"]:
                         outcome = "TP"
-                        exit_price = entry_price - TP_POINTS
-                        pnl = (entry_price - exit_price) * LOT_SIZE
-                        in_position = False
-                    elif h2 >= entry_price + SL_POINTS:
+                        exit_price = float(tp_order.get("average") or tp_order.get("price") or exit_price)
+                    elif sl_order and str(sl_order.get("status","")).lower() in ["closed","filled"]:
                         outcome = "SL"
-                        exit_price = entry_price + SL_POINTS
-                        pnl = (entry_price - exit_price) * LOT_SIZE
-                        in_position = False
+                        exit_price = float(sl_order.get("average") or sl_order.get("price") or exit_price)
 
-                if not in_position:
-                    balance += pnl
-                    log(f"[EXIT {outcome}] @ {round(exit_price,6)} | PnL: {round(pnl,6)} | Balance: {round(balance,6)}")
-                    if outcome=="SL":
+                    pnl = (exit_price - entry_price) * LOT_SIZE if entry_side=="buy" else (entry_price - exit_price) * LOT_SIZE
+                    log(f"[EXIT {outcome}] @ {exit_price} | PnL: {round(pnl,6)}")
+
+                    cancel_open_reduce_only(SYMBOL)
+
+                    if outcome == "SL":
                         cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
-                        last_trend = None
-                    else:
-                        last_tp_candle_close = c2
+                        log(f"❄️ Cooldown started for {COOLDOWN_MINUTES} minutes")
 
-                time.sleep(POLL_SLEEP)
+                    in_position = False
+                    entry_side = None
+                    entry_price = None
+                    tp_order_id = None
+                    sl_order_id = None
+                else:
+                    time.sleep(5)
 
         except KeyboardInterrupt:
-            log("Bot stopped by user.")
+            log("Interrupted by user. Exiting...")
             break
         except Exception as e:
             log("ERROR:", repr(e))
-            time.sleep(2)
-            continue
-
-# -------- AUTO-RESTART WRAPPER --------
-if __name__ == "__main__":
-    while True:
-        try:
-            run_paper_bot()
-        except Exception as e:
-            log("BOT CRASHED:", repr(e))
             log("Restarting bot in 5 seconds...")
             time.sleep(5)
             continue
+
+if __name__ == "__main__":
+    while True:  # AWS auto-restart loop
+        try:
+            run_bot()
+        except Exception as e:
+            log("BOT CRASHED:", repr(e))
+            log("Restarting in 5 seconds...")
+            time.sleep(5)
