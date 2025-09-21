@@ -10,8 +10,8 @@ API_KEY    = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 
 if not API_KEY or not API_SECRET:
-    raise SystemExit("❌ API_KEY / API_SECRET missing! Set them in AWS environment variables.")
-    
+    raise SystemExit("❌ API_KEY / API_SECRET missing! Set them in environment variables.")
+
 SYMBOL = "ETH/USDT"
 TIMEFRAME = "1m"
 LOT_SIZE = 0.02
@@ -30,11 +30,24 @@ exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "future", "adjustForTimeDifference": True}
+    "options": {
+        "defaultType": "future",
+        "adjustForTimeDifference": True
+    }
 })
 
+# ---------------- HELPERS ----------------
+def nowstr():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 def log(*args):
-    print(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), *args, flush=True
+    print(nowstr(), *args, flush=True)
+
+def fetch_candles(symbol, tf=TIMEFRAME, limit=50):  # only recent 50 candles
+    ohlc = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
+    df['time'] = pd.to_datetime(df['time'], unit='ms')
+    return df
 
 # -------- Candle pattern --------
 def is_strong_bullish(o,h,l,c):
@@ -51,30 +64,17 @@ def is_strong_bearish(o,h,l,c):
     lower_wick = c - l
     return (body<0 and abs(body)/rng>=0.55) or (body<0 and upper_wick>=2*abs(body) and lower_wick<=abs(body)*0.5) or (body<0 and (h-c)/rng>=0.75)
 
-# -------- Helpers --------
-def nowstr():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-def log(*args):
-    print(nowstr(), *args, flush=True)
-
-def fetch_candles(symbol, tf=TIMEFRAME, limit=200):
-    ohlc = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    return df
-
-# -------- Live Trading Bot --------
+# -------- LIVE BOT --------
 def run_live_bot():
     in_position = False
     cooldown_until = None
-    last_trend, crossover_idx, last_tp_candle_close = None, None, None
+    last_trend = None
 
     log(f"🚀 Starting LIVE BOT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
 
     while True:
         try:
-            df = fetch_candles(SYMBOL, TIMEFRAME, limit=200)
+            df = fetch_candles(SYMBOL, TIMEFRAME, limit=50)
             df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
             df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
 
@@ -86,6 +86,7 @@ def run_live_bot():
                 time.sleep(POLL_SLEEP)
                 continue
 
+            # EMA crossover detection
             emaF_prev, emaS_prev = df.iloc[-3]['ema_fast'], df.iloc[-3]['ema_slow']
             bullish_cross = (emaF_prev <= emaS_prev) and (emaF > emaS)
             bearish_cross = (emaF_prev >= emaS_prev) and (emaF < emaS)
@@ -95,16 +96,20 @@ def run_live_bot():
             slope_deg = abs(math.degrees(math.atan((emaF - emaF_past)/SLOPE_WINDOW)))
             slope_ok = slope_deg >= SLOPE_DEG
 
+            # Determine trend
             if bullish_cross and slope_ok:
-                last_trend, crossover_idx = "BUY", df.index[-2]
+                last_trend = "BUY"
             elif bearish_cross and slope_ok:
-                last_trend, crossover_idx = "SELL", df.index[-2]
+                last_trend = "SELL"
+            else:
+                last_trend = None
 
+            # Skip if no trend or already in position
             if in_position or last_trend is None:
                 time.sleep(POLL_SLEEP)
                 continue
 
-            # Check strong candle at last closed candle
+            # Check strong candle
             if last_trend=="BUY" and not is_strong_bullish(o,h,l,c):
                 time.sleep(POLL_SLEEP)
                 continue
@@ -112,15 +117,12 @@ def run_live_bot():
                 time.sleep(POLL_SLEEP)
                 continue
 
-            # Entry at current candle open
-            entry_candle = df.iloc[-1]
-            entry_price = entry_candle['open']
+            # Entry
+            entry_price = df.iloc[-1]['open']
             direction = last_trend
 
-            # Balance + margin check
             balance = exchange.fetch_balance()['USDT']['free']
-            notional = entry_price * LOT_SIZE
-            required_margin = notional / LEVERAGE
+            required_margin = entry_price * LOT_SIZE / LEVERAGE
             if balance < required_margin:
                 log(f"❌ Insufficient balance for {direction} at {entry_price}")
                 time.sleep(POLL_SLEEP)
@@ -128,9 +130,9 @@ def run_live_bot():
 
             # Place market order
             if direction=="BUY":
-                order = exchange.create_market_buy_order(SYMBOL, LOT_SIZE)
+                exchange.create_market_buy_order(SYMBOL, LOT_SIZE)
             else:
-                order = exchange.create_market_sell_order(SYMBOL, LOT_SIZE)
+                exchange.create_market_sell_order(SYMBOL, LOT_SIZE)
 
             tp_price = entry_price + TP_POINTS if direction=="BUY" else entry_price - TP_POINTS
             sl_price = entry_price - SL_POINTS if direction=="BUY" else entry_price + SL_POINTS
@@ -143,26 +145,23 @@ def run_live_bot():
                 df_new = fetch_candles(SYMBOL, TIMEFRAME, limit=2)
                 o2,h2,l2,c2 = df_new.iloc[-1][['open','high','low','close']]
 
+                outcome = None
                 if direction=="BUY":
                     if h2 >= tp_price:
                         outcome = "TP"
-                        in_position = False
                         exit_price = tp_price
                     elif l2 <= sl_price:
                         outcome = "SL"
-                        in_position = False
                         exit_price = sl_price
                 else:
                     if l2 <= tp_price:
                         outcome = "TP"
-                        in_position = False
                         exit_price = tp_price
                     elif h2 >= sl_price:
                         outcome = "SL"
-                        in_position = False
                         exit_price = sl_price
 
-                if not in_position:
+                if outcome:
                     # Close position
                     if direction=="BUY":
                         exchange.create_market_sell_order(SYMBOL, LOT_SIZE)
@@ -171,11 +170,11 @@ def run_live_bot():
 
                     log(f"[EXIT {outcome}] @ {round(exit_price,6)} | Direction: {direction}")
 
+                    in_position = False
                     if outcome=="SL":
                         cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
                         last_trend = None
-                    else:
-                        last_tp_candle_close = c2
+                    break
 
                 time.sleep(POLL_SLEEP)
 
@@ -188,7 +187,7 @@ def run_live_bot():
             continue
 
 if __name__ == "__main__":
-    while True:  # AWS auto-restart loop
+    while True:  # Auto-restart loop
         try:
             run_live_bot()
         except Exception as e:
