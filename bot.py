@@ -43,13 +43,20 @@ def nowstr():
 def log(*args):
     print(nowstr(), *args, flush=True)
 
-def fetch_candles(symbol, tf=TIMEFRAME, limit=50):  # only recent 50 candles
+def fetch_candles(symbol, tf=TIMEFRAME, limit=50):
     ohlc = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
     df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
     df['time'] = pd.to_datetime(df['time'], unit='ms')
     return df
 
-# -------- Candle pattern --------
+def get_open_position(symbol):
+    """Return current open position info if any"""
+    positions = exchange.fetch_positions([symbol])
+    for p in positions:
+        if float(p['contracts']) > 0:
+            return p
+    return None
+
 def is_strong_bullish(o,h,l,c):
     body = c - o
     rng = h-l if h-l!=0 else 1e-9
@@ -66,7 +73,6 @@ def is_strong_bearish(o,h,l,c):
 
 # -------- LIVE BOT --------
 def run_live_bot():
-    in_position = False
     cooldown_until = None
     last_trend = None
 
@@ -91,12 +97,10 @@ def run_live_bot():
             bullish_cross = (emaF_prev <= emaS_prev) and (emaF > emaS)
             bearish_cross = (emaF_prev >= emaS_prev) and (emaF < emaS)
 
-            # slope
             emaF_past = df.iloc[-1-SLOPE_WINDOW]['ema_fast']
             slope_deg = abs(math.degrees(math.atan((emaF - emaF_past)/SLOPE_WINDOW)))
             slope_ok = slope_deg >= SLOPE_DEG
 
-            # Determine trend
             if bullish_cross and slope_ok:
                 last_trend = "BUY"
             elif bearish_cross and slope_ok:
@@ -104,12 +108,12 @@ def run_live_bot():
             else:
                 last_trend = None
 
-            # Skip if no trend or already in position
-            if in_position or last_trend is None:
+            # --- Skip if already in position ---
+            pos = get_open_position(SYMBOL)
+            if pos:
                 time.sleep(POLL_SLEEP)
                 continue
 
-            # Check strong candle
             if last_trend=="BUY" and not is_strong_bullish(o,h,l,c):
                 time.sleep(POLL_SLEEP)
                 continue
@@ -128,7 +132,6 @@ def run_live_bot():
                 time.sleep(POLL_SLEEP)
                 continue
 
-            # Place market order
             if direction=="BUY":
                 exchange.create_market_buy_order(SYMBOL, LOT_SIZE)
             else:
@@ -136,41 +139,38 @@ def run_live_bot():
 
             tp_price = entry_price + TP_POINTS if direction=="BUY" else entry_price - TP_POINTS
             sl_price = entry_price - SL_POINTS if direction=="BUY" else entry_price + SL_POINTS
-            in_position = True
 
             log(f"[ENTRY {direction}] @ {round(entry_price,6)} | TP: {tp_price} | SL: {sl_price}")
 
-            # Monitor TP/SL
-            while in_position:
+            # Monitor position
+            while True:
                 df_new = fetch_candles(SYMBOL, TIMEFRAME, limit=2)
                 o2,h2,l2,c2 = df_new.iloc[-1][['open','high','low','close']]
 
                 outcome = None
                 if direction=="BUY":
                     if h2 >= tp_price:
-                        outcome = "TP"
-                        exit_price = tp_price
+                        outcome = "TP"; exit_price = tp_price
                     elif l2 <= sl_price:
-                        outcome = "SL"
-                        exit_price = sl_price
+                        outcome = "SL"; exit_price = sl_price
                 else:
                     if l2 <= tp_price:
-                        outcome = "TP"
-                        exit_price = tp_price
+                        outcome = "TP"; exit_price = tp_price
                     elif h2 >= sl_price:
-                        outcome = "SL"
-                        exit_price = sl_price
+                        outcome = "SL"; exit_price = sl_price
 
                 if outcome:
-                    # Close position
-                    if direction=="BUY":
-                        exchange.create_market_sell_order(SYMBOL, LOT_SIZE)
-                    else:
-                        exchange.create_market_buy_order(SYMBOL, LOT_SIZE)
+                    # Close with actual position size
+                    pos = get_open_position(SYMBOL)
+                    if pos:
+                        size = float(pos['contracts'])
+                        if direction=="BUY":
+                            exchange.create_market_sell_order(SYMBOL, size)
+                        else:
+                            exchange.create_market_buy_order(SYMBOL, size)
 
                     log(f"[EXIT {outcome}] @ {round(exit_price,6)} | Direction: {direction}")
 
-                    in_position = False
                     if outcome=="SL":
                         cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
                         last_trend = None
