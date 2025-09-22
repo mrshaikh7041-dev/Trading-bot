@@ -23,7 +23,8 @@ EMA_FAST = 13
 EMA_SLOW = 55
 SLOPE_WINDOW = 3
 SLOPE_DEG = 20
-POLL_SLEEP = 1  # seconds
+POLL_SLEEP = 1
+MAX_RETRIES = 5
 
 # ---------------- EXCHANGE ----------------
 exchange = ccxt.binance({
@@ -44,13 +45,18 @@ def log(*args):
     print(nowstr(), *args, flush=True)
 
 def fetch_candles(symbol, tf=TIMEFRAME, limit=50):
-    ohlc = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
-    df['time'] = pd.to_datetime(df['time'], unit='ms')
-    return df
+    for attempt in range(MAX_RETRIES):
+        try:
+            ohlc = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+            df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
+            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            return df
+        except Exception as e:
+            log(f"⚠️ Fetch candle error: {e}, retry {attempt+1}/{MAX_RETRIES}")
+            time.sleep(2 ** attempt)
+    raise Exception("Failed to fetch candles after retries")
 
 def get_open_position(symbol):
-    """Return current open position info if any"""
     positions = exchange.fetch_positions([symbol])
     for p in positions:
         if float(p['contracts']) > 0:
@@ -71,10 +77,17 @@ def is_strong_bearish(o,h,l,c):
     lower_wick = c - l
     return (body<0 and abs(body)/rng>=0.55) or (body<0 and upper_wick>=2*abs(body) and lower_wick<=abs(body)*0.5) or (body<0 and (h-c)/rng>=0.75)
 
+def ema_slope(df, ema_col, window):
+    if len(df) < window + 1:
+        return 0
+    delta_y = df[ema_col].iloc[-1] - df[ema_col].iloc[-window-1]
+    slope_deg = abs(math.degrees(math.atan(delta_y / window)))
+    return slope_deg
+
 # -------- LIVE BOT --------
 def run_live_bot():
     cooldown_until = None
-    last_trend = None
+    last_trade_candle = None
 
     log(f"🚀 Starting LIVE BOT | Lot: {LOT_SIZE} | Leverage: {LEVERAGE}x")
 
@@ -84,96 +97,116 @@ def run_live_bot():
             df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
             df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
 
-            last_candle = df.iloc[-2]
-            o,h,l,c = last_candle[['open','high','low','close']]
-            emaF, emaS = last_candle['ema_fast'], last_candle['ema_slow']
+            last_candle_time = df.index[-1]
+            o,h,l,c = df.iloc[-1][['open','high','low','close']]
 
+            # Skip if in cooldown
             if cooldown_until and datetime.utcnow() < cooldown_until:
                 time.sleep(POLL_SLEEP)
                 continue
 
-            # EMA crossover detection
-            emaF_prev, emaS_prev = df.iloc[-3]['ema_fast'], df.iloc[-3]['ema_slow']
+            # Skip if already traded this candle
+            if last_trade_candle == last_candle_time:
+                time.sleep(POLL_SLEEP)
+                continue
+            last_trade_candle = last_candle_time
+
+            # -------- ENTRY LOGIC (Same as previous code) --------
+            emaF_prev, emaS_prev = df['ema_fast'].iloc[-2], df['ema_slow'].iloc[-2]
+            emaF, emaS = df['ema_fast'].iloc[-1], df['ema_slow'].iloc[-1]
+
             bullish_cross = (emaF_prev <= emaS_prev) and (emaF > emaS)
             bearish_cross = (emaF_prev >= emaS_prev) and (emaF < emaS)
 
-            emaF_past = df.iloc[-1-SLOPE_WINDOW]['ema_fast']
-            slope_deg = abs(math.degrees(math.atan((emaF - emaF_past)/SLOPE_WINDOW)))
-            slope_ok = slope_deg >= SLOPE_DEG
+            slope_deg = ema_slope(df, 'ema_fast', SLOPE_WINDOW)
+            if slope_deg < SLOPE_DEG:
+                bullish_cross = bearish_cross = False
 
-            if bullish_cross and slope_ok:
-                last_trend = "BUY"
-            elif bearish_cross and slope_ok:
-                last_trend = "SELL"
-            else:
-                last_trend = None
+            side = None
+            if bullish_cross and is_strong_bullish(o,h,l,c):
+                side = "BUY"
+            elif bearish_cross and is_strong_bearish(o,h,l,c):
+                side = "SELL"
 
-            # --- Skip if already in position ---
+            if not side:
+                time.sleep(POLL_SLEEP)
+                continue
+
+            # Check if already in position
             pos = get_open_position(SYMBOL)
             if pos:
                 time.sleep(POLL_SLEEP)
                 continue
 
-            if last_trend=="BUY" and not is_strong_bullish(o,h,l,c):
-                time.sleep(POLL_SLEEP)
-                continue
-            if last_trend=="SELL" and not is_strong_bearish(o,h,l,c):
-                time.sleep(POLL_SLEEP)
-                continue
-
-            # Entry
-            entry_price = df.iloc[-1]['open']
-            direction = last_trend
-
+            # Margin check
             balance = exchange.fetch_balance()['USDT']['free']
-            required_margin = entry_price * LOT_SIZE / LEVERAGE
+            required_margin = c * LOT_SIZE / LEVERAGE
             if balance < required_margin:
-                log(f"❌ Insufficient balance for {direction} at {entry_price}")
+                log(f"❌ Insufficient balance {balance} USDT for {side} at {c}")
                 time.sleep(POLL_SLEEP)
                 continue
 
-            if direction=="BUY":
+            # -------- PLACE MARKET ORDER + OCO --------
+            if side=="BUY":
                 exchange.create_market_buy_order(SYMBOL, LOT_SIZE)
+                tp_side = 'SELL'
+                tp_price = c + TP_POINTS
+                sl_price = c - SL_POINTS
             else:
                 exchange.create_market_sell_order(SYMBOL, LOT_SIZE)
+                tp_side = 'BUY'
+                tp_price = c - TP_POINTS
+                sl_price = c + SL_POINTS
 
-            tp_price = entry_price + TP_POINTS if direction=="BUY" else entry_price - TP_POINTS
-            sl_price = entry_price - SL_POINTS if direction=="BUY" else entry_price + SL_POINTS
+            symbol_str = SYMBOL.replace('/','')
+            for attempt in range(MAX_RETRIES):
+                try:
+                    exchange.fapiPrivate_post_order_oco({
+                        'symbol': symbol_str,
+                        'side': tp_side,
+                        'quantity': LOT_SIZE,
+                        'price': round(tp_price,2),
+                        'stopPrice': round(sl_price,2),
+                        'stopLimitPrice': round(sl_price,2),
+                        'stopLimitTimeInForce': 'GTC'
+                    })
+                    break
+                except Exception as e:
+                    log(f"⚠️ OCO order error: {e}, retry {attempt+1}/{MAX_RETRIES}")
+                    time.sleep(2 ** attempt)
+            else:
+                log("❌ Failed to place OCO order after retries")
 
-            log(f"[ENTRY {direction}] @ {round(entry_price,6)} | TP: {tp_price} | SL: {sl_price}")
+            log(f"[ENTRY {side}] @ {round(c,6)} | TP: {round(tp_price,6)} | SL: {round(sl_price,6)}")
 
-            # Monitor position
+            # -------- MONITOR SL / TP FOR COOLDOWN --------
             while True:
+                pos = get_open_position(SYMBOL)
+                if not pos:
+                    break  # Position closed by OCO
+
                 df_new = fetch_candles(SYMBOL, TIMEFRAME, limit=2)
                 o2,h2,l2,c2 = df_new.iloc[-1][['open','high','low','close']]
 
-                outcome = None
-                if direction=="BUY":
-                    if h2 >= tp_price:
-                        outcome = "TP"; exit_price = tp_price
-                    elif l2 <= sl_price:
-                        outcome = "SL"; exit_price = sl_price
-                else:
-                    if l2 <= tp_price:
-                        outcome = "TP"; exit_price = tp_price
-                    elif h2 >= sl_price:
-                        outcome = "SL"; exit_price = sl_price
+                sl_hit = (side=="BUY" and l2 <= sl_price) or (side=="SELL" and h2 >= sl_price)
+                tp_hit = (side=="BUY" and h2 >= tp_price) or (side=="SELL" and l2 <= tp_price)
 
-                if outcome:
-                    # Close with actual position size
+                if sl_hit or tp_hit:
+                    # Close any remaining position
                     pos = get_open_position(SYMBOL)
                     if pos:
                         size = float(pos['contracts'])
-                        if direction=="BUY":
+                        if side=="BUY":
                             exchange.create_market_sell_order(SYMBOL, size)
                         else:
                             exchange.create_market_buy_order(SYMBOL, size)
 
-                    log(f"[EXIT {outcome}] @ {round(exit_price,6)} | Direction: {direction}")
+                    outcome = "SL" if sl_hit else "TP"
+                    exit_price = sl_price if sl_hit else tp_price
+                    log(f"[EXIT {outcome}] @ {round(exit_price,6)} | Direction: {side}")
 
-                    if outcome=="SL":
+                    if sl_hit:
                         cooldown_until = datetime.utcnow() + timedelta(minutes=COOLDOWN_MINUTES)
-                        last_trend = None
                     break
 
                 time.sleep(POLL_SLEEP)
@@ -182,12 +215,12 @@ def run_live_bot():
             log("Bot stopped by user.")
             break
         except Exception as e:
-            log("ERROR:", repr(e))
+            log("ERROR in main loop:", repr(e))
             time.sleep(2)
             continue
 
 if __name__ == "__main__":
-    while True:  # Auto-restart loop
+    while True:
         try:
             run_live_bot()
         except Exception as e:
