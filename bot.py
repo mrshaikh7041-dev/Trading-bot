@@ -5,9 +5,6 @@ import time
 from datetime import datetime, timedelta
 
 # ---------------- CONFIG ----------------
-API_KEY = ""  # optional for public data
-API_SECRET = ""  # optional for public data
-
 SYMBOL = "ETH/USDT"
 TIMEFRAME = "1m"
 LOT_SIZE = 0.02
