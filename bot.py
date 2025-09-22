@@ -16,7 +16,7 @@ EMA_FAST = 13
 EMA_SLOW = 55
 SLOPE_WINDOW = 3
 SLOPE_DEG = 20
-POLL_SLEEP = 1  # seconds
+POLL_SLEEP = 1 # seconds
 
 # Starting balance for paper trading
 START_BALANCE = 1.5
