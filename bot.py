@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import traceback
 import os
 import csv
+import logging
 
 # ---------------- CONFIG ----------------
 SYMBOL = "BNB/USDT"
@@ -17,8 +18,16 @@ BALANCE = 2.0
 COOLDOWN_MINUTES = 30
 SLIPPAGE_PERCENT = 0.0005
 FEE_RATE = 0.0006
-POLL_INTERVAL_SECONDS = 5  # data fetch interval
+POLL_INTERVAL_SECONDS = 10
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
+LOG_FILE = "bot.log"
+
+# ---------------- LOGGING SETUP ----------------
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # ---------------- EXCHANGE ----------------
 exchange = ccxt.binance({'enableRateLimit': True})
@@ -31,11 +40,9 @@ position = None
 
 # ---------------- UTILS ----------------
 def now_ist():
-    """Current timezone-aware IST time"""
     return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
 
 def fetch_latest_candles(symbol, timeframe, limit=200):
-    """Fetch latest OHLCV candles and return as dataframe"""
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not bars or len(bars) < 10:
@@ -44,11 +51,11 @@ def fetch_latest_candles(symbol, timeframe, limit=200):
         df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Kolkata")
         return df
     except Exception as e:
-        print(f"[ERROR] Fetch candles failed: {e}")
+        print(f"[ERROR] Fetch candles failed: {e}", flush=True)
+        logging.error(f"Fetch candles failed: {e}")
         return None
 
 def compute_emas(df):
-    """Compute EMA5, EMA9, EMA15, EMA21"""
     df = df.copy()
     df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
@@ -57,7 +64,6 @@ def compute_emas(df):
     return df
 
 def check_signal(candle):
-    """Check for BUY or SELL signal based on EMA strategy"""
     c = candle["close"]
     l = candle["low"]
     h = candle["high"]
@@ -66,13 +72,11 @@ def check_signal(candle):
     ema15 = candle["ema15"]
     ema21 = candle["ema21"]
 
-    # All EMAs same side
     if c > ema5 and c > ema9 and c > ema15 and c > ema21:
         return "BUY"
     if c < ema5 and c < ema9 and c < ema15 and c < ema21:
         return "SELL"
 
-    # EMA15 support/resistance touch
     if l <= ema15 <= h and c > ema15:
         return "BUY"
     if l <= ema15 <= h and c < ema15:
@@ -81,7 +85,6 @@ def check_signal(candle):
     return None
 
 def append_trade_csv(record):
-    """Append trade details to CSV"""
     header = ["time","dir","entry","exit","outcome","pnl","balance","fee"]
     file_exists = os.path.isfile(CSV_FN)
     with open(CSV_FN, "a", newline="") as f:
@@ -90,9 +93,12 @@ def append_trade_csv(record):
             writer.writeheader()
         writer.writerow(record)
 
-# ---------------- MAIN LOOP ----------------
-print(f"[{now_ist()}] 🚀 Starting EMA Bot ({SYMBOL}, Paper Trading)...")
+# ---------------- STARTUP MESSAGE ----------------
+STARTUP_MSG = f"🚀 Starting EMA Bot ({SYMBOL}, Paper Trading) | Starting Balance: {BALANCE} USDT"
+print(f"[{now_ist()}] {STARTUP_MSG}", flush=True)
+logging.info(STARTUP_MSG)
 
+# ---------------- MAIN LOOP ----------------
 while True:
     try:
         df = fetch_latest_candles(SYMBOL, TIMEFRAME, 200)
@@ -125,7 +131,7 @@ while True:
                     outcome = "TP"
                 elif recent["low"] <= sl_price:
                     outcome = "SL"
-            else:  # SELL
+            else:
                 if recent["low"] <= tp_price:
                     outcome = "TP"
                 elif recent["high"] >= sl_price:
@@ -150,7 +156,9 @@ while True:
                     "fee": round(fee,8)
                 }
                 append_trade_csv(rec)
-                print(f"[{now}] {outcome} {dir} trade closed. PnL: {round(pnl_after_fee,4)} | Balance: {round(balance,4)}")
+                msg = f"{outcome} {dir} trade closed. PnL: {round(pnl_after_fee,4)} | Balance: {round(balance,4)}"
+                print(f"[{now}] {msg}", flush=True)
+                logging.info(msg)
 
                 in_position = False
                 position = None
@@ -173,9 +181,13 @@ while True:
                         "entry_time": now
                     }
                     in_position = True
-                    print(f"[{now}] TP condition satisfied → Opening new {signal_after_tp} @ {entry_price}")
+                    msg = f"TP condition satisfied → Opening new {signal_after_tp} @ {entry_price}"
+                    print(f"[{now}] {msg}", flush=True)
+                    logging.info(msg)
                 else:
-                    print(f"[{now}] TP hit but condition not satisfied → Waiting for next valid setup")
+                    msg = "TP hit but condition not satisfied → Waiting for next valid setup"
+                    print(f"[{now}] {msg}", flush=True)
+                    logging.info(msg)
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
 
@@ -193,13 +205,19 @@ while True:
                 "entry_time": now
             }
             in_position = True
-            print(f"[{now}] Opening new trade {signal} @ {entry_price}")
+            msg = f"Opening new trade {signal} @ {entry_price}"
+            print(f"[{now}] {msg}", flush=True)
+            logging.info(msg)
         else:
-            print(f"[{now}] No valid signal or in cooldown → waiting...")
+            msg = "No valid signal or in cooldown → waiting..."
+            print(f"[{now}] {msg}", flush=True)
+            logging.info(msg)
 
         time.sleep(POLL_INTERVAL_SECONDS)
 
     except Exception as e:
-        print(f"[FATAL ERROR] {e}")
+        msg = f"[FATAL ERROR] {e}"
+        print(msg, flush=True)
+        logging.error(msg)
         traceback.print_exc()
         time.sleep(10)
