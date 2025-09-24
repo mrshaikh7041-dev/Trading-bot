@@ -1,7 +1,7 @@
 import ccxt
 import pandas as pd
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import traceback
 import os
 import csv
@@ -17,8 +17,7 @@ BALANCE = 2.0
 COOLDOWN_MINUTES = 30
 SLIPPAGE_PERCENT = 0.0005
 FEE_RATE = 0.0006
-POLL_INTERVAL_SECONDS = 10  # data fetch interval
-
+POLL_INTERVAL_SECONDS = 5  # data fetch interval
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
 
 # ---------------- EXCHANGE ----------------
@@ -32,21 +31,24 @@ position = None
 
 # ---------------- UTILS ----------------
 def now_ist():
-    return datetime.utcnow() + pd.Timedelta(hours=5, minutes=30)
+    """Current timezone-aware IST time"""
+    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
 
 def fetch_latest_candles(symbol, timeframe, limit=200):
+    """Fetch latest OHLCV candles and return as dataframe"""
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         if not bars or len(bars) < 10:
             return None
         df = pd.DataFrame(bars, columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms") + pd.Timedelta(hours=5, minutes=30)
+        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Kolkata")
         return df
     except Exception as e:
         print(f"[ERROR] Fetch candles failed: {e}")
         return None
 
 def compute_emas(df):
+    """Compute EMA5, EMA9, EMA15, EMA21"""
     df = df.copy()
     df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
@@ -55,6 +57,7 @@ def compute_emas(df):
     return df
 
 def check_signal(candle):
+    """Check for BUY or SELL signal based on EMA strategy"""
     c = candle["close"]
     l = candle["low"]
     h = candle["high"]
@@ -69,7 +72,7 @@ def check_signal(candle):
     if c < ema5 and c < ema9 and c < ema15 and c < ema21:
         return "SELL"
 
-    # 15 EMA support/resistance touch
+    # EMA15 support/resistance touch
     if l <= ema15 <= h and c > ema15:
         return "BUY"
     if l <= ema15 <= h and c < ema15:
@@ -78,6 +81,7 @@ def check_signal(candle):
     return None
 
 def append_trade_csv(record):
+    """Append trade details to CSV"""
     header = ["time","dir","entry","exit","outcome","pnl","balance","fee"]
     file_exists = os.path.isfile(CSV_FN)
     with open(CSV_FN, "a", newline="") as f:
@@ -87,7 +91,7 @@ def append_trade_csv(record):
         writer.writerow(record)
 
 # ---------------- MAIN LOOP ----------------
-print(f"[{now_ist()}] 🚀 Starting EMA Bot (BNB/USDT, Paper Trading)...")
+print(f"[{now_ist()}] 🚀 Starting EMA Bot ({SYMBOL}, Paper Trading)...")
 
 while True:
     try:
@@ -97,10 +101,9 @@ while True:
             continue
 
         df = compute_emas(df)
-
         now = now_ist()
 
-        # cooldown check
+        # ---------------- COOLDOWN CHECK ----------------
         if cooldown_until and now < cooldown_until:
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
@@ -110,7 +113,6 @@ while True:
 
         # ---------------- IN POSITION ----------------
         if in_position and position:
-            # intrabar check TP/SL
             recent = df.iloc[-1]
             dir = position["dir"]
             entry_price = position["entry"]
@@ -157,10 +159,9 @@ while True:
                     cooldown_until = now + timedelta(minutes=COOLDOWN_MINUTES)
                     continue
 
-                # TP hit, now check if strategy condition still satisfied
+                # TP hit, check new signal immediately
                 signal_after_tp = check_signal(last_closed_candle)
                 if signal_after_tp:
-                    # open new trade next candle
                     entry_price = next_candle_open * (1 + SLIPPAGE_PERCENT if signal_after_tp=="BUY" else 1 - SLIPPAGE_PERCENT)
                     tp_price = entry_price + TP_POINTS if signal_after_tp=="BUY" else entry_price - TP_POINTS
                     sl_price = entry_price - SL_POINTS if signal_after_tp=="BUY" else entry_price + SL_POINTS
@@ -202,4 +203,3 @@ while True:
         print(f"[FATAL ERROR] {e}")
         traceback.print_exc()
         time.sleep(10)
-        continue
