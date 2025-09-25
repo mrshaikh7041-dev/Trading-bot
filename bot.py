@@ -16,8 +16,6 @@ SL_POINTS = 3
 LEVERAGE = 100
 BALANCE = 2.0
 COOLDOWN_MINUTES = 30
-SLIPPAGE_PERCENT = 0.0005
-FEE_RATE = 0.0006
 POLL_INTERVAL_SECONDS = 5
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
 LOG_FILE = "bot.log"
@@ -85,7 +83,7 @@ def check_signal(candle):
     return None
 
 def append_trade_csv(record):
-    header = ["time","dir","entry","exit","outcome","pnl","balance","fee"]
+    header = ["time","dir","entry","exit","outcome","pnl","balance"]
     file_exists = os.path.isfile(CSV_FN)
     with open(CSV_FN, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=header)
@@ -138,28 +136,25 @@ while True:
                     outcome = "SL"
 
             if outcome:
-                # ✅ FIXED PnL CALCULATION
+                # PnL (without fee, leverage ignored)
                 if outcome == "TP":
-                    pnl = (tp_price - entry_price) * LOT_SIZE if dir=="BUY" else (entry_price - tp_price) * LOT_SIZE
+                    pnl = (tp_price - entry_price) * LOT_SIZE if dir == "BUY" else (entry_price - tp_price) * LOT_SIZE
                 else:  # SL case
-                    pnl = (sl_price - entry_price) * LOT_SIZE if dir=="BUY" else (entry_price - sl_price) * LOT_SIZE
+                    pnl = (sl_price - entry_price) * LOT_SIZE if dir == "BUY" else (entry_price - sl_price) * LOT_SIZE
 
-                fee = entry_price * LOT_SIZE * FEE_RATE * 2
-                pnl_after_fee = pnl - fee
-                balance += pnl_after_fee
+                balance += pnl
 
                 rec = {
                     "time": position["entry_time"].isoformat(),
                     "dir": dir,
                     "entry": entry_price,
-                    "exit": tp_price if outcome=="TP" else sl_price,
+                    "exit": tp_price if outcome == "TP" else sl_price,
                     "outcome": outcome,
-                    "pnl": round(pnl_after_fee,6),
-                    "balance": round(balance,6),
-                    "fee": round(fee,8)
+                    "pnl": round(pnl, 6),
+                    "balance": round(balance, 6),
                 }
                 append_trade_csv(rec)
-                msg = f"{outcome} {dir} trade closed. PnL: {round(pnl_after_fee,4)} | Balance: {round(balance,4)}"
+                msg = f"{outcome} {dir} trade closed. PnL: {round(pnl,4)} | Balance: {round(balance,4)}"
                 print(f"[{now}] {msg}", flush=True)
                 logging.info(msg)
 
@@ -173,9 +168,9 @@ while True:
                 # TP hit, check new signal immediately
                 signal_after_tp = check_signal(last_closed_candle)
                 if signal_after_tp:
-                    entry_price = next_candle_open * (1 + SLIPPAGE_PERCENT if signal_after_tp=="BUY" else 1 - SLIPPAGE_PERCENT)
-                    tp_price = entry_price + TP_POINTS if signal_after_tp=="BUY" else entry_price - TP_POINTS
-                    sl_price = entry_price - SL_POINTS if signal_after_tp=="BUY" else entry_price + SL_POINTS
+                    entry_price = next_candle_open
+                    tp_price = entry_price + TP_POINTS if signal_after_tp == "BUY" else entry_price - TP_POINTS
+                    sl_price = entry_price - SL_POINTS if signal_after_tp == "BUY" else entry_price + SL_POINTS
                     position = {
                         "dir": signal_after_tp,
                         "entry": entry_price,
@@ -197,9 +192,9 @@ while True:
         # ---------------- NOT IN POSITION ----------------
         signal = check_signal(last_closed_candle)
         if not in_position and signal:
-            entry_price = next_candle_open * (1 + SLIPPAGE_PERCENT if signal=="BUY" else 1 - SLIPPAGE_PERCENT)
-            tp_price = entry_price + TP_POINTS if signal=="BUY" else entry_price - TP_POINTS
-            sl_price = entry_price - SL_POINTS if signal=="BUY" else entry_price + SL_POINTS
+            entry_price = next_candle_open
+            tp_price = entry_price + TP_POINTS if signal == "BUY" else entry_price - TP_POINTS
+            sl_price = entry_price - SL_POINTS if signal == "BUY" else entry_price + SL_POINTS
             position = {
                 "dir": signal,
                 "entry": entry_price,
