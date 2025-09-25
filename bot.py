@@ -10,7 +10,7 @@ import logging
 # ---------------- CONFIG ----------------
 SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
-LOT_SIZE = 0.06
+LOT_SIZE = 0.08
 TP_POINTS = 6
 SL_POINTS = 3
 LEVERAGE = 100
@@ -18,7 +18,7 @@ BALANCE = 2.0
 COOLDOWN_MINUTES = 30
 SLIPPAGE_PERCENT = 0.0005
 FEE_RATE = 0.0006
-POLL_INTERVAL_SECONDS = 10
+POLL_INTERVAL_SECONDS = 5
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
 LOG_FILE = "bot.log"
 
@@ -138,9 +138,12 @@ while True:
                     outcome = "SL"
 
             if outcome:
-                pnl = (tp_price - entry_price) * LOT_SIZE if dir=="BUY" else (entry_price - tp_price) * LOT_SIZE
-                if outcome == "SL":
-                    pnl = -abs(pnl)
+                # ✅ FIXED PnL CALCULATION
+                if outcome == "TP":
+                    pnl = (tp_price - entry_price) * LOT_SIZE if dir=="BUY" else (entry_price - tp_price) * LOT_SIZE
+                else:  # SL case
+                    pnl = (sl_price - entry_price) * LOT_SIZE if dir=="BUY" else (entry_price - sl_price) * LOT_SIZE
+
                 fee = entry_price * LOT_SIZE * FEE_RATE * 2
                 pnl_after_fee = pnl - fee
                 balance += pnl_after_fee
