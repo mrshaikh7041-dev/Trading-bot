@@ -13,12 +13,11 @@ TIMEFRAME = "1m"
 LOT_SIZE = 0.08
 TP_POINTS = 6
 SL_POINTS = 3
-LEVERAGE = 100
 BALANCE = 2.0
 COOLDOWN_MINUTES = 30
-POLL_INTERVAL_SECONDS = 5
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
 LOG_FILE = "bot.log"
+FEE_RATE = 0.0005   # 0.05% one-time fee
 
 # ---------------- LOGGING SETUP ----------------
 logging.basicConfig(
@@ -35,6 +34,7 @@ balance = BALANCE
 in_position = False
 cooldown_until = None
 position = None
+wait_for_next_signal = False   # re-entry fix
 
 # ---------------- UTILS ----------------
 def now_ist():
@@ -101,7 +101,7 @@ while True:
     try:
         df = fetch_latest_candles(SYMBOL, TIMEFRAME, 200)
         if df is None:
-            time.sleep(POLL_INTERVAL_SECONDS)
+            time.sleep(1)
             continue
 
         df = compute_emas(df)
@@ -109,38 +109,53 @@ while True:
 
         # ---------------- COOLDOWN CHECK ----------------
         if cooldown_until and now < cooldown_until:
-            time.sleep(POLL_INTERVAL_SECONDS)
+            time.sleep(1)
             continue
 
-        last_closed_candle = df.iloc[-2]
-        next_candle_open = df.iloc[-1]["open"]
+        last_closed_candle = df.iloc[-2]   # completed candle
+        recent_candle = df.iloc[-1]        # running candle
+        next_open = recent_candle["open"]
 
         # ---------------- IN POSITION ----------------
         if in_position and position:
-            recent = df.iloc[-1]
             dir = position["dir"]
             entry_price = position["entry"]
             tp_price = position["tp_price"]
             sl_price = position["sl_price"]
 
             outcome = None
+            # OCO logic → check which level touched first in current candle
             if dir == "BUY":
-                if recent["high"] >= tp_price:
+                if recent_candle["low"] <= sl_price and recent_candle["high"] >= tp_price:
+                    # whichever is closer to entry is assumed first
+                    if abs(sl_price-entry_price) < abs(tp_price-entry_price):
+                        outcome = "SL"
+                    else:
+                        outcome = "TP"
+                elif recent_candle["high"] >= tp_price:
                     outcome = "TP"
-                elif recent["low"] <= sl_price:
+                elif recent_candle["low"] <= sl_price:
                     outcome = "SL"
             else:
-                if recent["low"] <= tp_price:
+                if recent_candle["low"] <= tp_price and recent_candle["high"] >= sl_price:
+                    if abs(sl_price-entry_price) < abs(tp_price-entry_price):
+                        outcome = "SL"
+                    else:
+                        outcome = "TP"
+                elif recent_candle["low"] <= tp_price:
                     outcome = "TP"
-                elif recent["high"] >= sl_price:
+                elif recent_candle["high"] >= sl_price:
                     outcome = "SL"
 
             if outcome:
-                # PnL (without fee, leverage ignored)
+                # PnL (apply fee once)
                 if outcome == "TP":
                     pnl = (tp_price - entry_price) * LOT_SIZE if dir == "BUY" else (entry_price - tp_price) * LOT_SIZE
-                else:  # SL case
+                else:
                     pnl = (sl_price - entry_price) * LOT_SIZE if dir == "BUY" else (entry_price - sl_price) * LOT_SIZE
+
+                fee = entry_price * LOT_SIZE * FEE_RATE
+                pnl -= fee
 
                 balance += pnl
 
@@ -163,36 +178,16 @@ while True:
 
                 if outcome == "SL":
                     cooldown_until = now + timedelta(minutes=COOLDOWN_MINUTES)
-                    continue
-
-                # TP hit, check new signal immediately
-                signal_after_tp = check_signal(last_closed_candle)
-                if signal_after_tp:
-                    entry_price = next_candle_open
-                    tp_price = entry_price + TP_POINTS if signal_after_tp == "BUY" else entry_price - TP_POINTS
-                    sl_price = entry_price - SL_POINTS if signal_after_tp == "BUY" else entry_price + SL_POINTS
-                    position = {
-                        "dir": signal_after_tp,
-                        "entry": entry_price,
-                        "tp_price": tp_price,
-                        "sl_price": sl_price,
-                        "entry_time": now
-                    }
-                    in_position = True
-                    msg = f"TP condition satisfied → Opening new {signal_after_tp} @ {entry_price}"
-                    print(f"[{now}] {msg}", flush=True)
-                    logging.info(msg)
                 else:
-                    msg = "TP hit but condition not satisfied → Waiting for next valid setup"
-                    print(f"[{now}] {msg}", flush=True)
-                    logging.info(msg)
-            time.sleep(POLL_INTERVAL_SECONDS)
+                    wait_for_next_signal = True   # TP ke baad agle setup ka wait kare
+
+            time.sleep(1)
             continue
 
         # ---------------- NOT IN POSITION ----------------
         signal = check_signal(last_closed_candle)
-        if not in_position and signal:
-            entry_price = next_candle_open
+        if not in_position and not wait_for_next_signal and signal:
+            entry_price = next_open
             tp_price = entry_price + TP_POINTS if signal == "BUY" else entry_price - TP_POINTS
             sl_price = entry_price - SL_POINTS if signal == "BUY" else entry_price + SL_POINTS
             position = {
@@ -207,15 +202,18 @@ while True:
             print(f"[{now}] {msg}", flush=True)
             logging.info(msg)
         else:
-            msg = "No valid signal or in cooldown → waiting..."
+            if wait_for_next_signal and signal is None:
+                wait_for_next_signal = False   # clear flag jab naya setup mile
+            msg = "No valid signal or waiting/cooldown → waiting..."
             print(f"[{now}] {msg}", flush=True)
             logging.info(msg)
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        # poll ko optimize → short sleep
+        time.sleep(1)
 
     except Exception as e:
         msg = f"[FATAL ERROR] {e}"
         print(msg, flush=True)
         logging.error(msg)
         traceback.print_exc()
-        time.sleep(10)
+        time.sleep(3)
