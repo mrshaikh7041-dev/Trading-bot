@@ -8,11 +8,11 @@ import csv
 import logging
 
 # ---------------- CONFIG ----------------
-SYMBOL = "BNB/USDT"
+SYMBOL = "XRP/USDT"
 TIMEFRAME = "1m"
-LOT_SIZE = 0.08
-TP_POINTS = 6
-SL_POINTS = 3
+LOT_SIZE = 25
+TP_POINTS = 0.016
+SL_POINTS = 0.008
 BALANCE = 2.0
 COOLDOWN_MINUTES = 30
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
