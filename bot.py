@@ -2,7 +2,6 @@ import ccxt
 import pandas as pd
 import time
 from datetime import datetime, timedelta, timezone
-import traceback
 import os
 import csv
 import logging
@@ -10,15 +9,20 @@ import logging
 # ---------------- CONFIG ----------------
 SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
-LOT_SIZE = 0.08
+LOT_SIZE = 0.10
 TP_POINTS = 6
 SL_POINTS = 3
-BALANCE = 2.0
+BALANCE = 5.0
+LEVERAGE = 100
 COOLDOWN_MINUTES = 30
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades_sync.csv"
 LOG_FILE = "bot.log"
-FEE_RATE = 0.0005   # 0.05% one-time fee
-CALC_WINDOW_SEC = 3  # last 3 sec window for calculation
+FEE_RATE = 0.0006  # 0.06% roundtrip fee
+
+# EMA sets
+EMA_SETS = {
+    "Set3": [10, 20, 50, 100],
+}
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -30,13 +34,6 @@ logging.basicConfig(
 # ---------------- EXCHANGE ----------------
 exchange = ccxt.binance({'enableRateLimit': True})
 
-# ---------------- STATE ----------------
-balance = BALANCE
-in_position = False
-cooldown_until = None
-position = None
-wait_for_next_signal = False
-
 # ---------------- UTILS ----------------
 def now_ist():
     return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
@@ -44,42 +41,47 @@ def now_ist():
 def fetch_latest_candles(symbol, timeframe, limit=200):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not bars or len(bars) < 10:
-            return None
         df = pd.DataFrame(bars, columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Kolkata")
+        df["time"] = pd.to_datetime(df["time"], unit="ms") + pd.Timedelta(hours=5, minutes=30)
         return df
-    except Exception as e:
-        print(f"[ERROR] Fetch candles failed: {e}", flush=True)
-        logging.error(f"Fetch candles failed: {e}")
+    except:
         return None
 
-def compute_emas(df):
+def apply_ema_strategy(df, ema_set):
     df = df.copy()
-    df["ema5"] = df["close"].ewm(span=5, adjust=False).mean()
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema15"] = df["close"].ewm(span=15, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    for span in ema_set:
+        df[f"ema{span}"] = df["close"].ewm(span=span).mean()
+
+    signals = []
+    for i in range(1, len(df)):
+        c = df.loc[i, "close"]
+        h = df.loc[i, "high"]
+        l = df.loc[i, "low"]
+        emas = [df.loc[i, f"ema{span}"] for span in ema_set]
+
+        signal = None
+        if all(c > e for e in emas):
+            signal = "BUY"
+        elif all(c < e for e in emas):
+            signal = "SELL"
+        elif l <= emas[len(emas)//2] <= h:
+            if c > emas[len(emas)//2]:
+                signal = "BUY"
+            elif c < emas[len(emas)//2]:
+                signal = "SELL"
+        signals.append(signal)
+    df["signal"] = [None] + signals
     return df
 
-def check_signal(candle):
-    c = candle["close"]
-    l = candle["low"]
-    h = candle["high"]
-    ema5 = candle["ema5"]
-    ema9 = candle["ema9"]
-    ema15 = candle["ema15"]
-    ema21 = candle["ema21"]
-
-    if c > ema5 and c > ema9 and c > ema15 and c > ema21:
-        return "BUY"
-    if c < ema5 and c < ema9 and c < ema15 and c < ema21:
-        return "SELL"
-    if l <= ema15 <= h and c > ema15:
-        return "BUY"
-    if l <= ema15 <= h and c < ema15:
-        return "SELL"
-    return None
+def order_book_filter(symbol):
+    try:
+        ob = exchange.fetch_order_book(symbol, limit=5)
+        top_bid = ob['bids'][0][0] if ob['bids'] else 0
+        top_ask = ob['asks'][0][0] if ob['asks'] else 0
+        spread = top_ask - top_bid
+        return spread <= 0.15
+    except:
+        return True
 
 def append_trade_csv(record):
     header = ["time","dir","entry","exit","outcome","pnl","balance"]
@@ -90,120 +92,102 @@ def append_trade_csv(record):
             writer.writeheader()
         writer.writerow(record)
 
-# ---------------- STARTUP MESSAGE ----------------
-STARTUP_MSG = f"🚀 Starting EMA Bot ({SYMBOL}, Paper Trading Synced) | Starting Balance: {BALANCE} USDT"
-print(f"[{now_ist()}] {STARTUP_MSG}", flush=True)
+# ---------------- STARTUP ----------------
+STARTUP_MSG = f"🚀 Starting Paper Bot with EMA Backtest Strategy | Balance: {BALANCE}"
+print(f"[{now_ist()}] {STARTUP_MSG}")
 logging.info(STARTUP_MSG)
 
 # ---------------- MAIN LOOP ----------------
+balance = BALANCE
+in_position = False
+position = None
+cooldown_until = None
+
 while True:
     try:
         df = fetch_latest_candles(SYMBOL, TIMEFRAME, 200)
-        if df is None:
+        if df is None or len(df) < 10:
             time.sleep(1)
             continue
 
-        df = compute_emas(df)
-        now = now_ist()
+        df = apply_ema_strategy(df, EMA_SETS["Set3"])
+        df = df.iloc[:-1]  # last candle is running
 
-        # ---------------- COOLDOWN CHECK ----------------
-        if cooldown_until and now < cooldown_until:
-            time.sleep(1)
-            continue
+        for idx, row in df.iterrows():
+            t = row["time"]
+            signal = row["signal"]
 
-        last_closed_candle = df.iloc[-2]   # completed candle
-        recent_candle = df.iloc[-1]        # running candle
-        next_open = recent_candle["open"]
+            if cooldown_until and t < cooldown_until:
+                continue
+            if in_position or not signal or idx+1 >= len(df):
+                continue
+            if not order_book_filter(SYMBOL):
+                continue
 
-        # ---------------- IN POSITION ----------------
-        if in_position and position:
-            dir = position["dir"]
-            entry_price = position["entry"]
-            tp_price = position["tp_price"]
-            sl_price = position["sl_price"]
+            next_open = df.loc[idx+1, "open"]
+            entry_price = next_open
+            tp_price = entry_price + TP_POINTS if signal=="BUY" else entry_price - TP_POINTS
+            sl_price = entry_price - SL_POINTS if signal=="BUY" else entry_price + SL_POINTS
 
-            outcome = None
-            if dir == "BUY":
-                if recent_candle["low"] <= sl_price and recent_candle["high"] >= tp_price:
-                    outcome = "TP" if abs(tp_price-entry_price)<abs(sl_price-entry_price) else "SL"
-                elif recent_candle["high"] >= tp_price:
-                    outcome = "TP"
-                elif recent_candle["low"] <= sl_price:
-                    outcome = "SL"
-            else:
-                if recent_candle["low"] <= tp_price and recent_candle["high"] >= sl_price:
-                    outcome = "TP" if abs(tp_price-entry_price)<abs(sl_price-entry_price) else "SL"
-                elif recent_candle["low"] <= tp_price:
-                    outcome = "TP"
-                elif recent_candle["high"] >= sl_price:
-                    outcome = "SL"
+            required_margin = entry_price * LOT_SIZE / LEVERAGE
+            if balance < required_margin:
+                break
 
-            if outcome:
-                pnl = (tp_price - entry_price) * LOT_SIZE if dir=="BUY" else (entry_price - tp_price) * LOT_SIZE
-                if outcome=="SL":
-                    pnl = (sl_price - entry_price)*LOT_SIZE if dir=="BUY" else (entry_price - sl_price)*LOT_SIZE
+            in_position = True
+            result = None
+
+            # 1s tick simulation instead of intrabar
+            for j in range(idx+1, len(df)):
+                o2,h2,l2,c2 = df.loc[j, ["open","high","low","close"]]
+                # simulate tick
+                price_ticks = [o2, h2, l2, c2]
+                for tick_price in price_ticks:
+                    if signal=="BUY":
+                        if tick_price >= tp_price:
+                            pnl = (tp_price - entry_price)*LOT_SIZE
+                            result = ("TP", tp_price, pnl, df.loc[j,"time"])
+                            break
+                        elif tick_price <= sl_price:
+                            pnl = -(entry_price - sl_price)*LOT_SIZE
+                            result = ("SL", sl_price, pnl, df.loc[j,"time"])
+                            break
+                    else:
+                        if tick_price <= tp_price:
+                            pnl = (entry_price - tp_price)*LOT_SIZE
+                            result = ("TP", tp_price, pnl, df.loc[j,"time"])
+                            break
+                        elif tick_price >= sl_price:
+                            pnl = -(sl_price - entry_price)*LOT_SIZE
+                            result = ("SL", sl_price, pnl, df.loc[j,"time"])
+                            break
+                if result:
+                    break
+
+            if result:
+                outcome, exit_price, pnl, exit_time = result
                 fee = entry_price * LOT_SIZE * FEE_RATE
                 pnl -= fee
                 balance += pnl
                 rec = {
-                    "time": position["entry_time"].isoformat(),
-                    "dir": dir,
+                    "time": df.loc[idx+1,"time"],
+                    "dir": signal,
                     "entry": entry_price,
-                    "exit": tp_price if outcome=="TP" else sl_price,
+                    "exit": exit_price,
                     "outcome": outcome,
                     "pnl": round(pnl,6),
                     "balance": round(balance,6)
                 }
                 append_trade_csv(rec)
-                msg = f"{outcome} {dir} trade closed. PnL: {round(pnl,4)} | Balance: {round(balance,4)}"
-                print(f"[{now}] {msg}", flush=True)
-                logging.info(msg)
+                print(f"[{now_ist()}] {outcome} {signal} closed. PnL: {round(pnl,4)} | Bal: {round(balance,4)}")
+                logging.info(f"{outcome} {signal} closed. PnL: {round(pnl,4)} | Bal: {round(balance,4)}")
                 in_position = False
                 position = None
                 if outcome=="SL":
-                    cooldown_until = now + timedelta(minutes=COOLDOWN_MINUTES)
-                else:
-                    wait_for_next_signal = True
-            time.sleep(1)
-            continue
+                    cooldown_until = exit_time + timedelta(minutes=COOLDOWN_MINUTES)
 
-        # ---------------- NOT IN POSITION ----------------
-        # last 3 sec window logic
-        candle_close_time = last_closed_candle["time"]
-        seconds_to_close = (pd.Timestamp.now(tz=last_closed_candle["time"].tz) - candle_close_time).total_seconds()
-        if seconds_to_close >= (60 - CALC_WINDOW_SEC):
-            signal = check_signal(last_closed_candle)
-            if not in_position and not wait_for_next_signal and signal:
-                entry_price = next_open
-                tp_price = entry_price + TP_POINTS if signal=="BUY" else entry_price - TP_POINTS
-                sl_price = entry_price - SL_POINTS if signal=="BUY" else entry_price + SL_POINTS
-                position = {
-                    "dir": signal,
-                    "entry": entry_price,
-                    "tp_price": tp_price,
-                    "sl_price": sl_price,
-                    "entry_time": now
-                }
-                in_position = True
-                msg = f"Opening new trade {signal} @ {entry_price}"
-                print(f"[{now}] {msg}", flush=True)
-                logging.info(msg)
-            else:
-                if wait_for_next_signal and signal is None:
-                    wait_for_next_signal = False
-                msg = "No valid signal or waiting/cooldown → waiting..."
-                print(f"[{now}] {msg}", flush=True)
-                logging.info(msg)
-        else:
-            # short sleep to sync with candle close
-            time.sleep(0.5)
-            continue
-
-        time.sleep(0.5)
+        time.sleep(1)
 
     except Exception as e:
-        msg = f"[FATAL ERROR] {e}"
-        print(msg, flush=True)
-        logging.error(msg)
-        traceback.print_exc()
+        print(f"[FATAL ERROR] {e}")
+        logging.error(f"[FATAL ERROR] {e}")
         time.sleep(3)
