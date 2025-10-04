@@ -6,6 +6,7 @@ import traceback
 import os
 import csv
 import logging
+import random
 
 # ---------------- CONFIG ----------------
 SYMBOL = "BNB/USDT"
@@ -18,12 +19,13 @@ LEVERAGE = 100
 COOLDOWN_MINUTES = 30
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
 LOG_FILE = "live_paper_bot.log"
-FEE_RATE = 0.0005   # same as earlier (both sides)
-ORDERBOOK_SPREAD_THRESHOLD = 0.15
+FEE_RATE = 0.0005
+ORDERBOOK_SPREAD_THRESHOLD = 0.15   # <- same absolute threshold as backtest
 HIST_LIMIT = 200
 MIN_SLEEP = 0.3
 
 EMA_SPANS = [10, 20, 50, 100]
+INTRABAR_STEPS = 10  # match backtest
 
 # ---------------- LOGGING SETUP ----------------
 logging.basicConfig(
@@ -61,7 +63,8 @@ def fetch_latest_candles(symbol, timeframe, limit=200):
 def compute_emas(df):
     df = df.copy()
     for span in EMA_SPANS:
-        df[f"ema{span}"] = df["close"].ewm(span=span, adjust=False).mean()
+        # use default adjust (same as backtest's ewm(...).mean())
+        df[f"ema{span}"] = df["close"].ewm(span=span).mean()
     return df
 
 def check_signal(candle):
@@ -91,6 +94,7 @@ def order_book_allows(symbol):
         top_bid = ob.get('bids')[0][0] if ob.get('bids') else 0
         top_ask = ob.get('asks')[0][0] if ob.get('asks') else 0
         spread = top_ask - top_bid
+        # EXACT same absolute spread check as backtest
         return spread <= ORDERBOOK_SPREAD_THRESHOLD
     except Exception as e:
         logging.warning(f"order_book_allows failed, permissive fallback: {e}")
@@ -118,7 +122,25 @@ while True:
             time.sleep(1)
             continue
 
-        df = compute_emas(df)
+        # --- EMA leak fix: compute EMAs only on closed candles (no look-ahead)
+        if len(df) < max(EMA_SPANS) + 5:
+            time.sleep(1)
+            continue
+
+        df_closed = df.iloc[:-1].copy()   # fully closed candles only
+        df_running = df.iloc[-1].copy()   # current forming candle
+
+        # compute EMAs on closed candles (matches backtest)
+        df_closed = compute_emas(df_closed)
+
+        if len(df_closed) < max(EMA_SPANS) + 2:
+            time.sleep(1)
+            continue
+
+        last_closed = df_closed.iloc[-1]  # fully closed candle with EMAs computed without lookahead
+        running = df_running
+        next_open = running["open"]
+
         now = now_ist()
 
         # cooldown
@@ -126,11 +148,7 @@ while True:
             time.sleep(1)
             continue
 
-        last_closed = df.iloc[-2]   # fully closed candle
-        running = df.iloc[-1]       # current forming candle
-        next_open = running["open"]
-
-        # If currently in a position -> check running candle for OCO outcome (no intrabar polling)
+        # If currently in a position -> check running candle for OCO outcome (intrabar simulation)
         if in_position and position:
             dir_ = position["dir"]
             entry_price = position["entry"]
@@ -138,30 +156,54 @@ while True:
             sl_price = position["sl_price"]
 
             outcome = None
-            # OCO logic: if both touched in same candle, assume the one closer to entry executed first
-            if dir_ == "BUY":
-                if running["low"] <= sl_price and running["high"] >= tp_price:
-                    outcome = "SL" if abs(sl_price - entry_price) < abs(tp_price - entry_price) else "TP"
-                elif running["high"] >= tp_price:
-                    outcome = "TP"
-                elif running["low"] <= sl_price:
-                    outcome = "SL"
-            else:  # SELL
-                if running["low"] <= tp_price and running["high"] >= sl_price:
-                    outcome = "SL" if abs(sl_price - entry_price) < abs(tp_price - entry_price) else "TP"
-                elif running["low"] <= tp_price:
-                    outcome = "TP"
-                elif running["high"] >= sl_price:
-                    outcome = "SL"
+
+            # Intrabar simulation (match backtest intrabar steps)
+            o = running["open"]
+            h = running["high"]
+            l = running["low"]
+
+            for k in range(1, INTRABAR_STEPS + 1):
+                price_up = o + (h - o) * k / INTRABAR_STEPS
+                price_down = o + (l - o) * k / INTRABAR_STEPS
+
+                if dir_ == "BUY":
+                    if price_up >= tp_price:
+                        outcome = "TP"
+                        exit_price = tp_price
+                        break
+                    if price_down <= sl_price:
+                        outcome = "SL"
+                        exit_price = sl_price
+                        break
+                else:  # SELL
+                    if price_down <= tp_price:
+                        outcome = "TP"
+                        exit_price = tp_price
+                        break
+                    if price_up >= sl_price:
+                        outcome = "SL"
+                        exit_price = sl_price
+                        break
+
+            # fallback (rare) to simple high/low
+            if not outcome:
+                if dir_ == "BUY":
+                    if running["high"] >= tp_price:
+                        outcome = "TP"; exit_price = tp_price
+                    elif running["low"] <= sl_price:
+                        outcome = "SL"; exit_price = sl_price
+                else:
+                    if running["low"] <= tp_price:
+                        outcome = "TP"; exit_price = tp_price
+                    elif running["high"] >= sl_price:
+                        outcome = "SL"; exit_price = sl_price
 
             if outcome:
-                # calculate pnl and apply fee
+                # calculate pnl and apply fee (kept same scheme)
                 if outcome == "TP":
                     pnl = (tp_price - entry_price) * LOT_SIZE if dir_ == "BUY" else (entry_price - tp_price) * LOT_SIZE
-                    exit_price = tp_price
                 else:
                     pnl = (sl_price - entry_price) * LOT_SIZE if dir_ == "BUY" else (entry_price - sl_price) * LOT_SIZE
-                    exit_price = sl_price
 
                 fee = entry_price * LOT_SIZE * FEE_RATE
                 pnl_after_fee = pnl - fee
@@ -196,11 +238,14 @@ while True:
         # Not in position -> evaluate signal on last closed candle
         signal = check_signal(last_closed)
         if (not in_position) and (not wait_for_next_signal) and signal:
-            # Orderbook check before opening
+            # Orderbook check before opening (same absolute threshold as backtest)
             if not order_book_allows(SYMBOL):
                 logging.info(f"[{now}] Orderbook blocked entry (spread too wide). Signal was {signal}.")
                 print(f"[{now}] Orderbook blocked entry. Skipping.", flush=True)
             else:
+                # optional small latency to better match backtest realism (commented out to keep behavior same)
+                # time.sleep(random.uniform(0.3, 1.0))
+
                 entry_price = next_open
                 tp_price = entry_price + TP_POINTS if signal == "BUY" else entry_price - TP_POINTS
                 sl_price = entry_price - SL_POINTS if signal == "BUY" else entry_price + SL_POINTS
@@ -210,7 +255,7 @@ while True:
                     logging.info(f"[{now}] Insufficient margin for trade. Required: {required_margin} | Bal: {balance}")
                     print(f"[{now}] Insufficient margin. Skipping.", flush=True)
                 else:
-                    # Open simulated position (no added latency)
+                    # Open simulated position
                     in_position = True
                     position = {
                         "dir": signal,
@@ -225,8 +270,6 @@ while True:
         else:
             if wait_for_next_signal and signal is None:
                 wait_for_next_signal = False
-            # quiet message to reduce spam
-            # print(f"[{now}] No signal / waiting...", flush=True)
 
         time.sleep(1)
 
