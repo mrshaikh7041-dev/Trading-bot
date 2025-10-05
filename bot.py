@@ -176,7 +176,6 @@ while True:
 
                 fee = entry * LOT_SIZE * FEE_RATE * 2
                 pnl -= fee
-                global balance
                 balance += pnl
 
                 rec = {
