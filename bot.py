@@ -16,7 +16,6 @@ SL_POINTS = 3
 BALANCE = 5.0
 LEVERAGE = 100
 COOLDOWN_MINUTES = 30
-ORDERBOOK_SPREAD_THRESHOLD = 0.15
 INTRABAR_STEPS = 10
 EMA_SPANS = [10, 20, 50, 100]
 CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
@@ -77,17 +76,6 @@ def check_signal(candle):
         elif c < mid_ema:
             return "SELL"
     return None
-
-def order_book_allows(symbol):
-    try:
-        ob = exchange.fetch_order_book(symbol, limit=5)
-        top_bid = ob["bids"][0][0] if ob["bids"] else 0
-        top_ask = ob["asks"][0][0] if ob["asks"] else 0
-        spread = top_ask - top_bid
-        return spread <= ORDERBOOK_SPREAD_THRESHOLD
-    except Exception as e:
-        logging.warning(f"order_book_allows failed, fallback True: {e}")
-        return True
 
 def append_trade_csv(record):
     header = ["time","dir","entry","exit","outcome","pnl","balance"]
@@ -206,31 +194,27 @@ while True:
         signal = check_signal(last_closed)
 
         if (not in_position) and (not wait_for_next_signal) and signal:
-            if not order_book_allows(SYMBOL):
-                print(f"[{now}] Spread too wide. Skip {signal}.", flush=True)
-                logging.info(f"Spread too wide. Skip {signal}.")
-            else:
-                entry = next_open
-                tp = entry + TP_POINTS if signal == "BUY" else entry - TP_POINTS
-                sl = entry - SL_POINTS if signal == "BUY" else entry + SL_POINTS
+            entry = next_open
+            tp = entry + TP_POINTS if signal == "BUY" else entry - TP_POINTS
+            sl = entry - SL_POINTS if signal == "BUY" else entry + SL_POINTS
 
-                required_margin = entry * LOT_SIZE / LEVERAGE
-                if balance < required_margin:
-                    print(f"[{now}] Insufficient margin. Skipping.", flush=True)
-                    continue
+            required_margin = entry * LOT_SIZE / LEVERAGE
+            if balance < required_margin:
+                print(f"[{now}] Insufficient margin. Skipping.", flush=True)
+                continue
 
-                in_position = True
-                position = {
-                    "dir": signal,
-                    "entry": entry,
-                    "tp": tp,
-                    "sl": sl,
-                    "entry_time": now
-                }
+            in_position = True
+            position = {
+                "dir": signal,
+                "entry": entry,
+                "tp": tp,
+                "sl": sl,
+                "entry_time": now
+            }
 
-                msg = f"Opened {signal} @ {round(entry,6)} | TP: {round(tp,6)} | SL: {round(sl,6)}"
-                print(f"[{now}] {msg}", flush=True)
-                logging.info(msg)
+            msg = f"Opened {signal} @ {round(entry,6)} | TP: {round(tp,6)} | SL: {round(sl,6)}"
+            print(f"[{now}] {msg}", flush=True)
+            logging.info(msg)
 
         elif wait_for_next_signal and signal is None:
             wait_for_next_signal = False
