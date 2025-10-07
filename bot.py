@@ -1,232 +1,163 @@
-import ccxt
+import websocket
+import json
 import pandas as pd
-import time
-from datetime import datetime, timedelta, timezone
-import traceback
-import os
+import numpy as np
 import csv
-import logging
+import time
+from datetime import datetime, timedelta
 
-# ================= CONFIG =================
-SYMBOL = "BNB/USDT"
-TIMEFRAME = "1m"
+# ---------------- CONFIG ----------------
+PAIR = 'bnbusdt'
+TIMEFRAME = '1m'
+EMAS = [10, 20, 50, 100]
 LOT_SIZE = 0.10
 TP_POINTS = 6
 SL_POINTS = 3
-BALANCE = 5.0
-LEVERAGE = 100
-COOLDOWN_MINUTES = 30
-INTRABAR_STEPS = 10
-EMA_SPANS = [10, 20, 50, 100]
-CSV_FN = f"{SYMBOL.replace('/','_')}_paper_trades.csv"
-LOG_FILE = "live_paper_bot.log"
-FEE_RATE = 0.0005        # same as backtest
+COOLDOWN_CANDLES = 30
+INITIAL_BALANCE = 5.0  # virtual balance
+INTRABAR_STEPS = 20
+LEVERAGE = 100  # virtual leverage for margin check
+CSV_FILE = 'trades_log.csv'
 
-# ================= LOGGING =================
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-exchange = ccxt.binance({'enableRateLimit': True})
-
-# ================= STATE =================
-balance = BALANCE
-in_position = False
-position = None
+# ---------------- STATE ----------------
+balance = INITIAL_BALANCE
+active_trade = None  # {'side': 'LONG/SHORT', 'entry': price, 'tp': price, 'sl': price, 'timestamp': time}
 cooldown_until = None
-wait_for_next_signal = False
+candles = pd.DataFrame()
 
-# ================= HELPERS =================
-def now_ist():
-    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
+# ---------------- INITIALIZE CSV ----------------
+with open(CSV_FILE, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['timestamp', 'side', 'entry', 'exit', 'result', 'balance', 'reason'])
 
-def fetch_latest_candles(symbol, timeframe, limit=200):
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not bars or len(bars) < max(EMA_SPANS) + 5:
-            return None
-        df = pd.DataFrame(bars, columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Kolkata")
-        return df
-    except Exception as e:
-        logging.error(f"fetch_latest_candles failed: {e}")
-        return None
-
-def compute_emas(df):
-    for span in EMA_SPANS:
-        df[f"ema{span}"] = df["close"].ewm(span=span).mean()
+# ---------------- EMA FUNCTIONS ----------------
+def calculate_emas(df):
+    for period in EMAS:
+        df[f'EMA{period}'] = df['close'].ewm(span=period, adjust=False).mean()
     return df
 
-def check_signal(candle):
-    c = candle["close"]
-    h = candle["high"]
-    l = candle["low"]
-    emas = [candle[f"ema{span}"] for span in EMA_SPANS]
-    mid_ema = emas[len(emas)//2]
+# ---------------- INTRABAR CHECK ----------------
+def intrabar_check(candle):
+    global active_trade, balance, cooldown_until
+    high, low, open_p = candle['high'], candle['low'], candle['open']
+    step_size = (high - low) / INTRABAR_STEPS
 
-    if all(c > e for e in emas):
-        return "BUY"
-    elif all(c < e for e in emas):
-        return "SELL"
-    elif l <= mid_ema <= h:
-        if c > mid_ema:
-            return "BUY"
-        elif c < mid_ema:
-            return "SELL"
-    return None
+    for i in range(1, INTRABAR_STEPS + 1):
+        price = low + step_size * i
 
-def append_trade_csv(record):
-    header = ["time","dir","entry","exit","outcome","pnl","balance"]
-    file_exists = os.path.isfile(CSV_FN)
-    with open(CSV_FN, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=header)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(record)
+        if active_trade:
+            # Check TP
+            if active_trade['side'] == 'LONG' and price >= active_trade['tp']:
+                balance += LOT_SIZE * TP_POINTS
+                log_trade(active_trade['side'], active_trade['entry'], active_trade['tp'], 'TP')
+                active_trade = None
+                cooldown_until = None  # TP does not trigger cooldown
+                break
+            elif active_trade['side'] == 'SHORT' and price <= active_trade['tp']:
+                balance += LOT_SIZE * TP_POINTS
+                log_trade(active_trade['side'], active_trade['entry'], active_trade['tp'], 'TP')
+                active_trade = None
+                cooldown_until = None
+                break
+            # Check SL
+            elif active_trade['side'] == 'LONG' and price <= active_trade['sl']:
+                balance -= LOT_SIZE * SL_POINTS
+                log_trade(active_trade['side'], active_trade['entry'], active_trade['sl'], 'SL')
+                active_trade = None
+                cooldown_until = len(candles) + COOLDOWN_CANDLES
+                break
+            elif active_trade['side'] == 'SHORT' and price >= active_trade['sl']:
+                balance -= LOT_SIZE * SL_POINTS
+                log_trade(active_trade['side'], active_trade['entry'], active_trade['sl'], 'SL')
+                active_trade = None
+                cooldown_until = len(candles) + COOLDOWN_CANDLES
+                break
 
-# ================= STARTUP =================
-msg = f"🚀 Starting Live Paper Trader ({SYMBOL}) | Bal={BALANCE} | TF={TIMEFRAME}"
-print(f"[{now_ist()}] {msg}", flush=True)
-logging.info(msg)
+# ---------------- LOG TRADE ----------------
+def log_trade(side, entry, exit_price, reason):
+    global balance
+    with open(CSV_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([datetime.now(), side, entry, exit_price, reason, balance, reason])
+    print(f'{datetime.now()} | {side} | Entry: {entry} | Exit: {exit_price} | Reason: {reason} | Balance: {balance}')
 
-# ================= MAIN LOOP =================
-while True:
-    try:
-        df = fetch_latest_candles(SYMBOL, TIMEFRAME)
-        if df is None:
-            time.sleep(1)
-            continue
+# ---------------- CHECK ENTRY ----------------
+def check_entry():
+    global active_trade, cooldown_until, candles
+    if active_trade:
+        return
+    if cooldown_until and len(candles) < cooldown_until:
+        return  # in cooldown
 
-        # use closed candles only for EMAs/signals
-        df_closed = df.iloc[:-1].copy()
-        df_closed = compute_emas(df_closed)
+    last = candles.iloc[-1]
+    close = last['close']
+    entry_price = close
+    required_margin = LOT_SIZE * entry_price / LEVERAGE
 
-        if len(df_closed) < max(EMA_SPANS) + 2:
-            time.sleep(1)
-            continue
+    if balance < required_margin:
+        print(f'Insufficient balance for virtual leverage. Needed: {required_margin}, Available: {balance}')
+        return  # cannot open trade due to virtual margin
 
-        last_closed = df_closed.iloc[-1]
-        running = df.iloc[-1]
-        next_open = running["open"]
-        now = now_ist()
+    if close > last[[f'EMA{p}' for p in EMAS]].max():
+        # LONG setup
+        active_trade = {
+            'side': 'LONG',
+            'entry': entry_price,
+            'tp': entry_price + TP_POINTS,
+            'sl': entry_price - SL_POINTS,
+            'timestamp': datetime.now()
+        }
+        print(f'LONG signal generated at {active_trade["entry"]}')
+    elif close < last[[f'EMA{p}' for p in EMAS]].min():
+        # SHORT setup
+        active_trade = {
+            'side': 'SHORT',
+            'entry': entry_price,
+            'tp': entry_price - TP_POINTS,
+            'sl': entry_price + SL_POINTS,
+            'timestamp': datetime.now()
+        }
+        print(f'SHORT signal generated at {active_trade["entry"]}')
 
-        # cooldown
-        if cooldown_until and now < cooldown_until:
-            time.sleep(1)
-            continue
+# ---------------- WEBSOCKET ----------------
+def on_message(ws, message):
+    global candles
+    data = json.loads(message)
+    k = data['k']
+    candle = {
+        'open': float(k['o']),
+        'high': float(k['h']),
+        'low': float(k['l']),
+        'close': float(k['c']),
+        'timestamp': k['t']
+    }
 
-        # ====== check running position ======
-        if in_position and position:
-            o = running["open"]
-            h = running["high"]
-            l = running["low"]
-            dir_ = position["dir"]
-            entry = position["entry"]
-            tp = position["tp"]
-            sl = position["sl"]
+    # Append new candle if timestamp is new
+    if len(candles) == 0 or candle['timestamp'] != candles.iloc[-1]['timestamp']:
+        candles = pd.concat([candles, pd.DataFrame([candle])], ignore_index=True)
+        candles = calculate_emas(candles)
 
-            outcome = None
-            exit_price = None
+        if len(candles) > max(EMAS) + 1:
+            intrabar_check(candle)
+            check_entry()
 
-            for k in range(1, INTRABAR_STEPS + 1):
-                price_up = o + (h - o) * k / INTRABAR_STEPS
-                price_down = o + (l - o) * k / INTRABAR_STEPS
-                if dir_ == "BUY":
-                    if price_up >= tp:
-                        outcome, exit_price = "TP", tp; break
-                    if price_down <= sl:
-                        outcome, exit_price = "SL", sl; break
-                else:
-                    if price_down <= tp:
-                        outcome, exit_price = "TP", tp; break
-                    if price_up >= sl:
-                        outcome, exit_price = "SL", sl; break
+def on_error(ws, error):
+    print('Error:', error)
 
-            if not outcome:
-                if dir_ == "BUY":
-                    if running["high"] >= tp:
-                        outcome, exit_price = "TP", tp
-                    elif running["low"] <= sl:
-                        outcome, exit_price = "SL", sl
-                else:
-                    if running["low"] <= tp:
-                        outcome, exit_price = "TP", tp
-                    elif running["high"] >= sl:
-                        outcome, exit_price = "SL", sl
+def on_close(ws):
+    print('Connection closed')
 
-            if outcome:
-                if outcome == "TP":
-                    pnl = (tp - entry) * LOT_SIZE if dir_ == "BUY" else (entry - tp) * LOT_SIZE
-                else:
-                    pnl = -(entry - sl) * LOT_SIZE if dir_ == "BUY" else -(sl - entry) * LOT_SIZE
+def on_open(ws):
+    print('WebSocket connection opened')
 
-                fee = entry * LOT_SIZE * FEE_RATE * 2
-                pnl -= fee
-                balance += pnl
-
-                rec = {
-                    "time": position["entry_time"].isoformat(),
-                    "dir": dir_,
-                    "entry": round(entry, 6),
-                    "exit": round(exit_price, 6),
-                    "outcome": outcome,
-                    "pnl": round(pnl, 6),
-                    "balance": round(balance, 6)
-                }
-                append_trade_csv(rec)
-                msg = f"{outcome} {dir_} | PnL: {round(pnl,6)} | Bal: {round(balance,6)}"
-                print(f"[{now}] {msg}", flush=True)
-                logging.info(msg)
-
-                in_position = False
-                position = None
-                if outcome == "SL":
-                    cooldown_until = now + timedelta(minutes=COOLDOWN_MINUTES)
-                else:
-                    wait_for_next_signal = True
-
-            time.sleep(1)
-            continue
-
-        # ====== new signal evaluation ======
-        signal = check_signal(last_closed)
-
-        if (not in_position) and (not wait_for_next_signal) and signal:
-            entry = next_open
-            tp = entry + TP_POINTS if signal == "BUY" else entry - TP_POINTS
-            sl = entry - SL_POINTS if signal == "BUY" else entry + SL_POINTS
-
-            required_margin = entry * LOT_SIZE / LEVERAGE
-            if balance < required_margin:
-                print(f"[{now}] Insufficient margin. Skipping.", flush=True)
-                continue
-
-            in_position = True
-            position = {
-                "dir": signal,
-                "entry": entry,
-                "tp": tp,
-                "sl": sl,
-                "entry_time": now
-            }
-
-            msg = f"Opened {signal} @ {round(entry,6)} | TP: {round(tp,6)} | SL: {round(sl,6)}"
-            print(f"[{now}] {msg}", flush=True)
-            logging.info(msg)
-
-        elif wait_for_next_signal and signal is None:
-            wait_for_next_signal = False
-
-        time.sleep(1)
-
-    except KeyboardInterrupt:
-        print("Stopped manually.", flush=True)
-        logging.info("Stopped manually.")
-        break
-    except Exception as e:
-        logging.error(f"Main loop error: {e}")
-        traceback.print_exc()
-        time.sleep(2)
-        continue
+# ---------------- START ----------------
+if __name__ == "__main__":
+    ws_url = f'wss://fstream.binance.com/ws/{PAIR}@kline_{TIMEFRAME}'
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
