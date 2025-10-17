@@ -1,5 +1,4 @@
-# live_binance_perp_ws_bot_complete_refined.py
-
+# live_binance_perp_ws_bot_complete_final.py
 import ccxt
 import pandas as pd
 import time
@@ -17,15 +16,15 @@ import json
 SYMBOL = 'BNB/USDT'
 TIMEFRAME = '1m'
 LOT_SIZE = 0.10
-SL_POINTS = 3.0
-TP_POINTS = 6.0
+SL_POINTS = 3.0   # absolute points (USDT)
+TP_POINTS = 6.0   # absolute points (USDT)
 LEVERAGE = 100
 COOLDOWN_MINUTES = 30
 POLL_INTERVAL_SECONDS = 5
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
 LOG_FILE = 'bot.log'
 
-# --- Binance API keys placeholders ---
+# --- Binance API keys placeholders (fill locally if needed) ---
 API_KEY = 'czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ'
 API_SECRET = 'cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO'
 
@@ -64,13 +63,16 @@ balance_lock = threading.Lock()
 
 listen_key = None
 listen_key_last_refresh = None
-LISTENKEY_REFRESH_INTERVAL = 25 * 60  # refresh every 25 minutes
+LISTENKEY_REFRESH_INTERVAL = 25 * 60  # seconds
+listenkey_refresh_thread = None
+listenkey_thread_stop = False
 
-# =================== UTILS ===================
+# =================== HELPERS ===================
 def fetch_usdt_balance():
     try:
         bal = exchange.fetch_balance({'type': 'future'})
         if isinstance(bal, dict):
+            # prefer structure bal['USDT']['total'] or bal['total']['USDT']
             if 'USDT' in bal and isinstance(bal['USDT'], dict):
                 if bal['USDT'].get('total') is not None:
                     return float(bal['USDT']['total'])
@@ -83,7 +85,7 @@ def fetch_usdt_balance():
                 return float(bal.get('total')['USDT'])
         return None
     except Exception as e:
-        logging.warning(f"fetch_usdt_balance failed: {e}")
+        log.warning(f"fetch_usdt_balance failed: {e}")
         return None
 
 def append_trade_csv(record):
@@ -98,18 +100,33 @@ def append_trade_csv(record):
 def _round_amount(symbol, amount):
     try:
         market = exchange.markets.get(symbol)
-        precision = market.get('precision', {}).get('amount')
+        precision = None
+        if market:
+            precision = market.get('precision', {}).get('amount')
         if precision is not None:
             return float(round(amount, precision))
     except Exception:
         pass
     return amount
 
+def _round_price(symbol, price):
+    try:
+        market = exchange.markets.get(symbol)
+        precision = None
+        if market:
+            precision = market.get('precision', {}).get('price')
+        if precision is not None:
+            return float(round(price, precision))
+    except Exception:
+        pass
+    return float(price)
+
 # =================== EMA STRATEGY ===================
 def fetch_latest_candles(symbol, timeframe, limit=200):
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not bars or len(bars) < 10: return None
+        if not bars or len(bars) < 10:
+            return None
         df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
         df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True).dt.tz_convert('Asia/Kolkata')
         return df
@@ -153,71 +170,103 @@ def set_leverage(symbol, leverage):
     try:
         sym = symbol.replace('/', '')
         exchange.fapiPrivate_post_leverage({'symbol': sym, 'leverage': int(leverage)})
-        logging.info(f"Leverage {leverage} set for {symbol}")
+        log.info(f"Leverage {leverage} set for {symbol}")
     except Exception as e:
-        logging.warning(f"Set leverage failed: {e}")
+        log.warning(f"Set leverage failed: {e}")
 
 def create_market_entry(symbol, side, amount):
     try:
         amount_rounded = _round_amount(symbol, amount)
-        logging.info(f"Placing market entry: {side} {amount_rounded} {symbol}")
+        log.info(f"Placing market entry: {side} {amount_rounded} {symbol}")
         order = exchange.create_order(symbol, 'market', side.lower(), amount_rounded, None, {'reduceOnly': False})
-        logging.info(f"Entry order placed: id={order.get('id')}")
+        log.info(f"Entry order placed: id={order.get('id')}")
         return order
     except Exception as e:
-        logging.error(f"Market entry failed: {e}")
+        log.error(f"Market entry failed: {e}")
         raise
 
 def place_tp_sl(symbol, side, amount, tp_price, sl_price):
+    """
+    Place TP and SL as absolute prices (already computed).
+    Returns (tp_order, sl_order) or (None, None) on failures individually.
+    """
     close_side = 'sell' if side == 'BUY' else 'buy'
     amount_rounded = _round_amount(symbol, amount)
     tp_order = sl_order = None
+    tp_price = _round_price(symbol, tp_price)
+    sl_price = _round_price(symbol, sl_price)
     try:
-        tp_order = exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', close_side, amount_rounded, None, {'stopPrice': float(tp_price), 'reduceOnly': True})
-        logging.info(f"TP order placed id={tp_order.get('id')}")
+        # TAKE_PROFIT_MARKET with stopPrice
+        tp_order = exchange.create_order(
+            symbol, 'TAKE_PROFIT_MARKET', close_side, amount_rounded, None,
+            {'stopPrice': float(tp_price), 'reduceOnly': True}
+        )
+        log.info(f"TP order placed id={tp_order.get('id')} price={tp_price}")
     except Exception as e:
-        logging.warning(f"TP placement failed: {e}")
+        log.warning(f"TP placement failed: {e}")
     try:
-        sl_order = exchange.create_order(symbol, 'STOP_MARKET', close_side, amount_rounded, None, {'stopPrice': float(sl_price), 'reduceOnly': True})
-        logging.info(f"SL order placed id={sl_order.get('id')}")
+        # STOP_MARKET with stopPrice
+        sl_order = exchange.create_order(
+            symbol, 'STOP_MARKET', close_side, amount_rounded, None,
+            {'stopPrice': float(sl_price), 'reduceOnly': True}
+        )
+        log.info(f"SL order placed id={sl_order.get('id')} price={sl_price}")
     except Exception as e:
-        logging.warning(f"SL placement failed: {e}")
+        log.warning(f"SL placement failed: {e}")
     return tp_order, sl_order
 
-# =================== LISTENKEY HANDLING ===================
-def create_listen_key():
+# =================== LISTENKEY / REFRESH THREAD ===================
+def create_listen_key(retries=3, wait=2):
     global listen_key, listen_key_last_refresh
-    try:
-        res = exchange.fapiPrivate_post_listenKey()
-        listen_key = res.get('listenKey') if isinstance(res, dict) else res
-        if not listen_key:
-            print(f"[WS] ListenKey creation failed, response={res}", flush=True)
-            log.error(f"ListenKey creation failed, response={res}")
-            return False
-        listen_key_last_refresh = time.time()
-        print(f"[WS] ListenKey created", flush=True)
-        log.info("ListenKey created")
-        return True
-    except Exception as e:
-        print(f"[WS] ListenKey creation exception: {e}", flush=True)
-        log.error(f"ListenKey creation exception: {e}")
-        return False
-
-def refresh_listen_key_if_needed():
-    global listen_key, listen_key_last_refresh
-    if not listen_key:
-        return create_listen_key()
-    if time.time() - listen_key_last_refresh > LISTENKEY_REFRESH_INTERVAL:
+    attempt = 0
+    while attempt < retries:
+        attempt += 1
         try:
-            exchange.fapiPrivate_put_listenKey({'listenKey': listen_key})
-            listen_key_last_refresh = time.time()
-            print(f"[WS] ListenKey refreshed", flush=True)
-            log.info("ListenKey refreshed")
+            res = exchange.fapiPrivate_post_listenKey()
+            # ccxt sometimes returns dict or raw key string
+            listen_key = res.get('listenKey') if isinstance(res, dict) else res
+            if listen_key:
+                listen_key_last_refresh = time.time()
+                log.info("ListenKey created")
+                print(f"[WS] ListenKey created", flush=True)
+                return True
+            else:
+                log.error(f"ListenKey creation returned unexpected: {res}")
+                print(f"[WS] ListenKey creation returned unexpected: {res}", flush=True)
         except Exception as e:
-            print(f"[WS] ListenKey refresh failed: {e}", flush=True)
-            log.error(f"ListenKey refresh failed: {e}")
+            log.error(f"ListenKey creation exception: {e}")
+            print(f"[WS] ListenKey creation exception: {e}", flush=True)
+        time.sleep(wait * attempt)
+    return False
 
-# =================== WEBSOCKET HANDLER ===================
+def background_listenkey_refresher():
+    global listenkey_thread_stop, listen_key_last_refresh, listen_key
+    while not listenkey_thread_stop:
+        if not listen_key:
+            created = create_listen_key()
+            if not created:
+                # wait a bit and retry
+                time.sleep(5)
+                continue
+        # try refresh when interval passed
+        try:
+            if time.time() - (listen_key_last_refresh or 0) >= LISTENKEY_REFRESH_INTERVAL:
+                try:
+                    exchange.fapiPrivate_put_listenKey({'listenKey': listen_key})
+                    listen_key_last_refresh = time.time()
+                    log.info("ListenKey refreshed (background)")
+                    print("[WS] ListenKey refreshed (background)", flush=True)
+                except Exception as e:
+                    log.error(f"ListenKey refresh failed (background): {e}")
+                    print(f"[WS] ListenKey refresh failed (background): {e}", flush=True)
+        except Exception as e:
+            log.error(f"ListenKey refresher outer exception: {e}")
+        # sleep small chunk to allow prompt exit
+        for _ in range(10):
+            if listenkey_thread_stop: break
+            time.sleep(1)
+
+# =================== WEBSOCKET HANDLERS ===================
 def on_message(ws, msg):
     global in_position, position, current_balance
     try:
@@ -231,7 +280,7 @@ def on_message(ws, msg):
         return
 
     o = data.get('o') or {}
-    status = o.get('X')
+    status = o.get('X')  # e.g., NEW, PARTIALLY_FILLED, FILLED, CANCELED
     order_id_raw = o.get('i')
     order_id = str(order_id_raw) if order_id_raw is not None else None
     side = (o.get('S') or '').upper()
@@ -241,12 +290,14 @@ def on_message(ws, msg):
     except Exception:
         avg_price = None
 
+    # nothing to do if we aren't tracking a position
     if not in_position or not position:
         return
 
     tp_id = str(position.get('tp_id')) if position.get('tp_id') else None
     sl_id = str(position.get('sl_id')) if position.get('sl_id') else None
 
+    # If one of our TP/SL orders filled
     if order_id in (tp_id, sl_id) and status == 'FILLED':
         outcome = 'TP' if order_id == tp_id else 'SL'
         exit_price = avg_price or (position.get('tp_price') if outcome == 'TP' else position.get('sl_price'))
@@ -281,8 +332,8 @@ def on_message(ws, msg):
             print(f"[{now_str()}] SL hit → cooldown until {cooldown_until}", flush=True)
             log.info(f"SL cooldown until {cooldown_until}")
         else:
-            print(f"[{now_str()}] TP occurred → re-entry blocked until next candle.", flush=True)
-            log.info("Re-entry blocked on same candle after TP (exchange).")
+            print(f"[{now_str()}] TP occurred → re-entry allowed (no cooldown).", flush=True)
+            log.info("TP occurred → re-entry allowed (no cooldown).")
 
 def on_error(ws, err):
     print(f"[WS ERROR] {err}", flush=True)
@@ -297,24 +348,39 @@ def on_open(ws):
     log.info("WS connected")
 
 def start_ws():
-    global ws_stop
+    """
+    Starts websocket and ensures listenKey exists.
+    The background_listenkey_refresher runs in separate thread to keep listenKey refreshed.
+    """
+    global ws_stop, listenkey_refresh_thread, listenkey_thread_stop
+
+    # ensure listenKey exists (create_listen_key will try several times)
     if not create_listen_key():
-        print("[WS] Cannot start WS without listenKey.", flush=True)
+        print("[WS] Cannot start WS without listenKey. Exiting WS thread.", flush=True)
+        log.error("Cannot start WS without listenKey.")
         return
+
+    # start background listener to refresh listenKey periodically
+    listenkey_thread_stop = False
+    listenkey_refresh_thread = threading.Thread(target=background_listenkey_refresher, daemon=True)
+    listenkey_refresh_thread.start()
 
     while not ws_stop:
         try:
-            refresh_listen_key_if_needed()
             ws_url = f"wss://fstream.binance.com/ws/{listen_key}"
             ws = websocket.WebSocketApp(ws_url, on_message=on_message, on_error=on_error, on_close=on_close, on_open=on_open)
-            ws.run_forever()
+            print("[WS] connecting to", ws_url, flush=True)
+            ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             print(f"[WS] run_forever error: {e}", flush=True)
             log.error(f"WS run_forever error: {e}")
-        time.sleep(2)  # small delay before reconnect
+        # small delay & then reconnect automatically
+        if not ws_stop:
+            print("[WS] reconnecting in 2s...", flush=True)
+            time.sleep(2)
 
 # =================== STARTUP ===================
-STARTUP_MSG = "🚀 [EMA LIVE BOT] BNB/USDT | Binance Perpetual | OCO Mode Enabled"
+STARTUP_MSG = "🚀 [EMA LIVE BOT] BNB/USDT | Binance Perpetual | OCO Mode Enabled (final)"
 print(f"[{now_str()}] {STARTUP_MSG}", flush=True)
 log.info(STARTUP_MSG)
 
@@ -335,7 +401,7 @@ ws_thread.start()
 try:
     set_leverage(SYMBOL, LEVERAGE)
 except Exception as e:
-    logging.warning(f"Leverage set failed at startup: {e}")
+    log.warning(f"Leverage set failed at startup: {e}")
 
 while True:
     try:
@@ -346,28 +412,32 @@ while True:
 
         df = compute_emas(df)
 
+        # enforce cooldown after SL only
         if cooldown_until and now_ist() < cooldown_until:
             print(f"[{now_str()}] In cooldown until {cooldown_until} ➡ sleeping...", flush=True)
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
 
-        last_closed = df.iloc[-2]
+        last_closed = df.iloc[-2]  # last fully closed candle
         live_candle = df.iloc[-1]
         next_open = float(live_candle['open'])
         last_closed_time_iso = str(last_closed['time'].isoformat())
 
+        # do not open new if already in position
         if in_position:
             time.sleep(POLL_INTERVAL_SECONDS)
             continue
 
         signal = check_signal(last_closed)
         if signal:
+            # prevent double processing same candle
             if last_processed_candle_time == last_closed_time_iso:
                 print(f'[{now_str()}] Skipping entry: last_closed {last_closed_time_iso} already processed.', flush=True)
                 log.info("Skipping entry because last_closed was already processed.")
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
+            # compute entry and absolute TP/SL prices
             entry_price = float(next_open)
             if signal == "BUY":
                 tp_price = entry_price + TP_POINTS
@@ -376,6 +446,10 @@ while True:
                 tp_price = entry_price - TP_POINTS
                 sl_price = entry_price + SL_POINTS
 
+            # round prices to market precision
+            tp_price = _round_price(SYMBOL, tp_price)
+            sl_price = _round_price(SYMBOL, sl_price)
+
             try:
                 print(f"[{now_str()}] Placing live trade: {signal} amount={LOT_SIZE} TP={tp_price} SL={sl_price} Lev={LEVERAGE}", flush=True)
                 log.info(f"Placing live trade: {signal} amount={LOT_SIZE} TP={tp_price} SL={sl_price} Lev={LEVERAGE}")
@@ -383,15 +457,31 @@ while True:
                 side_ccxt = 'buy' if signal == 'BUY' else 'sell'
                 entry_order = create_market_entry(SYMBOL, side_ccxt, LOT_SIZE)
 
-                entry_price_actual = entry_order.get('average') or entry_order.get('price') or (entry_order.get('info') or {}).get('avgPrice')
+                # derive realized entry price
+                entry_price_actual = None
+                try:
+                    entry_price_actual = entry_order.get('average') or entry_order.get('price') or (entry_order.get('info') or {}).get('avgPrice')
+                except Exception:
+                    entry_price_actual = None
                 if not entry_price_actual:
                     try:
                         entry_price_actual = exchange.fetch_ticker(SYMBOL).get('last')
                     except Exception:
-                        entry_price_actual = entry_price
+                        entry_price_actual = entry_price  # fallback to assumed next_open
 
+                entry_price_actual = float(entry_price_actual)
+                # ensure we compute TP/SL off the actual entry price, not assumed next_open
+                if signal == "BUY":
+                    tp_price = _round_price(SYMBOL, entry_price_actual + TP_POINTS)
+                    sl_price = _round_price(SYMBOL, entry_price_actual - SL_POINTS)
+                else:
+                    tp_price = _round_price(SYMBOL, entry_price_actual - TP_POINTS)
+                    sl_price = _round_price(SYMBOL, entry_price_actual + SL_POINTS)
+
+                # place TP and SL on exchange
                 tp_order, sl_order = place_tp_sl(SYMBOL, signal, LOT_SIZE, tp_price, sl_price)
 
+                # store position state
                 position = {
                     'dir': signal,
                     'entry': float(entry_price_actual),
@@ -422,7 +512,9 @@ while True:
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt received. Exiting gracefully...", flush=True)
         log.info("KeyboardInterrupt received. Stopping bot.")
+        # stop ws & background threads
         ws_stop = True
+        listenkey_thread_stop = True
         time.sleep(1)
         sys.exit(0)
     except Exception as e:
