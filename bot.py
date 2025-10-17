@@ -40,7 +40,7 @@ def now_str():
     return now_ist().strftime('%Y-%m-%d %H:%M:%S %Z')
 
 # =================== EXCHANGE (ccxt) ===================
-exchange = ccxt.binance({
+exchange = ccxt.binanceusdm({
     'apiKey': API_KEY,
     'secret': API_SECRET,
     'enableRateLimit': True,
