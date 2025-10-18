@@ -1,9 +1,11 @@
-# live_binance_perp_ws_full_ready.py
+# live_binance_perp_ws_final.py
 """
-Live Binance USDT-Perp EMA bot — Full WebSocket + ListenKey + Fallback Polling
-Symbol: BNB/USDT
-Leverage: 75x
-TP_POINTS = 6.0, SL_POINTS = 3.0
+Live Binance USDT-Perp EMA bot — FINAL ready version
+- Symbol: BNB/USDT
+- Leverage: 75x
+- LOT_SIZE: 0.01 (test-safe)
+- TP_POINTS: 6, SL_POINTS: 3
+- Full: kline WS (public) + user data WS (listenKey) + fallback poller
 """
 import ccxt
 import pandas as pd
@@ -32,11 +34,10 @@ COOLDOWN_MINUTES = 30
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
 LOG_FILE = 'bot.log'
 
-# Fill your keys locally (do NOT share)
+# Fill locally BEFORE running:
 API_KEY = 'czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ'
 API_SECRET = 'cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO'
 
-# Binance REST base for futures (mainnet)
 FUTURES_REST_BASE = 'https://fapi.binance.com'
 
 # =================== LOGGING ===================
@@ -44,7 +45,7 @@ logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-# =================== TIME ===================
+# =================== TIMEZONE ===================
 KOLKATA = timezone(timedelta(hours=5, minutes=30))
 def now_ist():
     return datetime.now(timezone.utc).astimezone(KOLKATA)
@@ -68,24 +69,18 @@ position = None
 cooldown_until = None
 last_processed_candle_time = None
 
-# Kline storage for EMA calculation
-kline_deque = deque(maxlen=500)  # [open, high, low, close, volume, startTime]
-
-# ListenKey / WS objects
+kline_deque = deque(maxlen=600)  # store closed klines: [open,high,low,close,volume,t]
 listen_key = None
 listen_key_lock = threading.Lock()
 ws_user = None
 ws_kline = None
 stop_all = False
 
-# thread-safe balance
 balance_lock = threading.Lock()
 current_balance = None
-
-# track user-WS alive
 user_ws_alive = False
 
-# =================== UTILITIES ===================
+# =================== HELPERS ===================
 def fetch_usdt_balance():
     try:
         bal = exchange.fetch_balance({'type': 'future'})
@@ -107,7 +102,7 @@ def append_trade_csv(record):
     header = ['time', 'dir', 'entry', 'exit', 'outcome', 'pnl', 'balance']
     exists = os.path.isfile(CSV_FN)
     with open(CSV_FN,'a',newline='',encoding='utf-8') as f:
-        writer = csv.DictWriter(f,fieldnames=header)
+        writer = csv.DictWriter(f, fieldnames=header)
         if not exists:
             writer.writeheader()
         writer.writerow(record)
@@ -129,22 +124,6 @@ def price_round(symbol, price):
     except:
         return round(price, prec)
 
-# =================== ORDER HELPERS ===================
-def set_leverage(symbol, leverage):
-    try:
-        sym = symbol.replace('/','')
-        # Some ccxt versions expect this exact method name:
-        if hasattr(exchange, 'fapiPrivatePostLeverage'):
-            exchange.fapiPrivatePostLeverage({'symbol': sym, 'leverage': int(leverage)})
-        elif hasattr(exchange, 'fapiPrivatePostLeverage'):
-            exchange.fapiPrivatePostLeverage({'symbol': sym, 'leverage': int(leverage)})
-        else:
-            # try generic
-            exchange.request('fapi/v1/leverage','POST',{'symbol':sym,'leverage':int(leverage)})
-        logging.info(f"Leverage {leverage} set for {symbol}")
-    except Exception as e:
-        logging.warning(f"Set leverage failed: {e}")
-
 def _round_amount(symbol, amount):
     try:
         market = exchange.markets.get(symbol)
@@ -154,6 +133,19 @@ def _round_amount(symbol, amount):
     except Exception:
         pass
     return amount
+
+# =================== ORDER HELPERS ===================
+def set_leverage(symbol, leverage):
+    try:
+        sym = symbol.replace('/','')
+        # try common ccxt wrappers
+        if hasattr(exchange, 'fapiPrivatePostLeverage'):
+            exchange.fapiPrivatePostLeverage({'symbol': sym, 'leverage': int(leverage)})
+        else:
+            exchange.request('fapi/v1/leverage','POST',{'symbol':sym,'leverage':int(leverage)})
+        logging.info(f"Leverage {leverage} set for {symbol}")
+    except Exception as e:
+        logging.warning(f"Set leverage failed: {e}")
 
 def create_market_entry(symbol, side, amount):
     try:
@@ -185,7 +177,7 @@ def place_tp_sl(symbol, side, amount, tp_price, sl_price):
         logging.warning(f"SL placement failed: {e}")
     return tp_order, sl_order
 
-# =================== EMA STRATEGY ===================
+# =================== STRATEGY (EMA) ===================
 def compute_emas_from_deque():
     if len(kline_deque) < 12:
         return None
@@ -221,7 +213,6 @@ def on_kline_message(ws, message):
         data = json.loads(message)
     except Exception:
         return
-    # wrapper stream vs direct
     payload = data.get('data') if isinstance(data, dict) and data.get('data') else data
     k = payload.get('k') or {}
     if not k:
@@ -235,18 +226,15 @@ def on_kline_message(ws, message):
             if df is None:
                 return
             signal = check_signal_from_df(df)
-            # convert time
             last_iso = pd.to_datetime(t, unit='ms', utc=True).tz_convert('Asia/Kolkata').isoformat()
-            # cooldown check
+            # cooldown
             if cooldown_until is not None and now_ist() < cooldown_until:
                 logging.info(f"In cooldown until {cooldown_until} -> skipping")
                 return
             if signal and not in_position:
                 if last_processed_candle_time == last_iso:
                     return
-                # entry using current close (we place market order)
                 entry_price = c
-                # compute TP/SL with rounding
                 if signal == 'BUY':
                     tp = price_round(SYMBOL, entry_price + TP_POINTS)
                     sl = price_round(SYMBOL, entry_price - SL_POINTS)
@@ -256,7 +244,6 @@ def on_kline_message(ws, message):
                 # place trade
                 try:
                     logging.info(f"Signal {signal} detected. Creating entry market and TP/SL (TP={tp}, SL={sl})")
-                    # ensure leverage
                     try:
                         set_leverage(SYMBOL, LEVERAGE)
                     except Exception:
@@ -271,7 +258,6 @@ def on_kline_message(ws, message):
                         entry_price_actual = None
                     if not entry_price_actual:
                         entry_price_actual = entry_price
-                    # place TP & SL
                     tp_ord, sl_ord = place_tp_sl(SYMBOL, signal, LOT_SIZE, tp, sl)
                     position = {
                         'dir': signal,
@@ -317,7 +303,7 @@ def start_kline_ws():
             logging.error(f"kline ws run_forever error: {e}")
         time.sleep(2)
 
-# =================== USER DATA (listenKey) via REST + WS ===================
+# =================== USER DATA WS (listenKey) ===================
 def create_listenkey_via_requests():
     url = FUTURES_REST_BASE + '/fapi/v1/listenKey'
     headers = {'X-MBX-APIKEY': API_KEY}
@@ -335,7 +321,7 @@ def keepalive_listenkey_worker(lk):
     headers = {'X-MBX-APIKEY': API_KEY}
     while not stop_all:
         try:
-            time.sleep(60 * 25)  # every 25 minutes
+            time.sleep(60 * 25)
             requests.put(url, headers=headers, params={'listenKey': lk}, timeout=10)
             logging.debug("Sent listenKey keepalive")
         except Exception as e:
@@ -348,24 +334,21 @@ def on_user_message(ws, message):
         data = json.loads(message)
     except Exception:
         return
-    # unwrap
     payload = data.get('data') if isinstance(data, dict) and data.get('data') else data
     evt_type = payload.get('e')
     if evt_type not in ('ORDER_TRADE_UPDATE','ACCOUNT_UPDATE'):
         return
-    # ORDER_TRADE_UPDATE handling
     if evt_type == 'ORDER_TRADE_UPDATE':
         o = payload.get('o') or {}
         status = o.get('X')
         order_id = str(o.get('i')) if o.get('i') is not None else None
-        side = (o.get('S') or '').upper()
         avg_price_str = o.get('ap')
         try:
             avg_price = float(avg_price_str) if avg_price_str and avg_price_str != '0' else None
         except:
             avg_price = None
         if not in_position or not position:
-            # maybe manual close or other user order - we still want to detect if our position is closed
+            # if we have no position but got user event, possibly manual close - try to detect in fallback poller
             return
         tp_id = str(position.get('tp_id')) if position.get('tp_id') else None
         sl_id = str(position.get('sl_id')) if position.get('sl_id') else None
@@ -391,7 +374,7 @@ def on_user_message(ws, message):
             append_trade_csv(rec)
             print(f"[{now_str()}] {outcome} closed via user WS. PnL: {round(pnl,6)} | Balance: {rec['balance']}", flush=True)
             log.info(f"{outcome} closed via user WS. {rec}")
-            # cleanup
+            # cleanup + cooldown for SL
             in_position = False
             position = None
             if outcome == 'SL':
@@ -399,7 +382,6 @@ def on_user_message(ws, message):
                 print(f"[{now_str()}] SL hit → cooldown until {cooldown_until}", flush=True)
             else:
                 print(f"[{now_str()}] TP occurred → re-entry blocked until next candle.", flush=True)
-    # ACCOUNT_UPDATE could be used to detect balance/position changes if needed
 
 def on_user_open(ws):
     global user_ws_alive
@@ -419,8 +401,8 @@ def start_user_ws():
     global listen_key, ws_user, stop_all, user_ws_alive
     while not stop_all:
         try:
-            # Try ccxt helper first if available
             lk = None
+            # try ccxt helper first
             try:
                 if hasattr(exchange, 'fapiPrivatePostListenKey'):
                     res = exchange.fapiPrivatePostListenKey()
@@ -430,7 +412,6 @@ def start_user_ws():
                         lk = res
             except Exception:
                 lk = None
-            # fallback to requests
             if not lk:
                 lk = create_listenkey_via_requests()
             if not lk:
@@ -439,7 +420,6 @@ def start_user_ws():
                 continue
             with listen_key_lock:
                 listen_key = lk
-            # spawn keepalive
             ka = threading.Thread(target=keepalive_listenkey_worker, args=(lk,), daemon=True)
             ka.start()
             ws_url = f"wss://fstream.binance.com/ws/{lk}"
@@ -451,45 +431,45 @@ def start_user_ws():
             logging.error(f"user ws run_forever exception: {e}")
         time.sleep(2)
 
-# =================== FALLBACK POLLING (safety) ===================
+# =================== FALLBACK POLLER ===================
 def fallback_position_poller():
-    """
-    If user-WS is down or misses events, poll positions every 15s and detect external closes.
-    """
     global in_position, position
     while not stop_all:
         try:
             time.sleep(15)
             if not in_position:
                 continue
-            # fetch positions
+            # get position risk from futures API
             try:
-                pos_list = exchange.fapiPrivate_get_positionrisk()  # ccxt raw request
+                pos_list = exchange.request('fapi/v2/positionRisk', 'GET', {})
             except Exception:
-                # fallback to ccxt fetch_positions if available
                 try:
                     pos_list = exchange.fetch_positions([SYMBOL])
                 except Exception:
                     pos_list = None
             if not pos_list:
                 continue
-            # pos_list may be a list of dicts (positionRisk)
-            # find our symbol
             found = None
             for p in pos_list:
+                # positionRisk returns symbol like 'BNBUSDT'
                 sym = p.get('symbol') or p.get('symbol', None)
-                if sym and sym.replace('USDT','/USDT') == SYMBOL.replace('/',''):
+                if not sym:
+                    continue
+                # normalize to 'BNB/USDT'
+                # for 'BNBUSDT' -> 'BNB/USDT'
+                candidate = sym
+                if isinstance(sym, str) and sym.endswith('USDT') and len(sym) > 4:
+                    candidate_sym = sym[:-4] + '/USDT'
+                else:
+                    candidate_sym = sym
+                if candidate_sym == SYMBOL:
                     found = p
                     break
-                # ccxt fetch_positions uses 'symbol' like 'BNB/USDT'
                 if p.get('symbol') == SYMBOL:
                     found = p
                     break
             if not found:
-                # couldn't find symbol -> skip
                 continue
-            # determine if position size is zero
-            # in positionRisk API, 'positionAmt' indicates qty (string)
             pos_amt = None
             if 'positionAmt' in found:
                 try:
@@ -501,52 +481,26 @@ def fallback_position_poller():
                     pos_amt = float(found.get('contracts', 0))
                 except:
                     pos_amt = None
-            # if zero or near zero -> external close
+            # if position appears closed externally (zero)
             if pos_amt is not None and abs(pos_amt) < 1e-8:
-                # external/manual close detected
-                print(f"[{now_str()}] External/manual close detected by poll. Resetting state.", flush=True)
+                print(f"[{now_str()}] External/manual close detected by poll. Resetting internal state.", flush=True)
                 log.info("External/manual close detected by poll.")
-                # No PnL calculation here; rely on prior order fills or manual judgement
+                # reset internal state (do not assume SL; no cooldown)
                 in_position = False
                 position = None
         except Exception as e:
             logging.debug(f"fallback poll error: {e}")
 
-# =================== STARTUP ===================
+# =================== STARTUP & THREADS ===================
 print(f"[{now_str()}] 🚀 EMA LIVE BOT START — {SYMBOL} | Leverage {LEVERAGE} | TP {TP_POINTS} SL {SL_POINTS}", flush=True)
 with balance_lock:
     current_balance = fetch_usdt_balance()
 print(f"[{now_str()}] Starting USDT balance: {current_balance}", flush=True)
 log.info("Bot startup")
 
-# Start user ws thread
+# start threads
 t_user = threading.Thread(target=start_user_ws, daemon=True)
 t_user.start()
-# Start kline ws thread
 t_k = threading.Thread(target=start_kline_ws, daemon=True)
 t_k.start()
-# Start fallback poller
-t_poll = threading.Thread(target=fallback_position_poller, daemon=True)
-t_poll.start()
-
-# set leverage once
-try:
-    set_leverage(SYMBOL, LEVERAGE)
-except Exception as e:
-    logging.warning(f"Leverage set failed at startup: {e}")
-
-# main thread: keep alive & minimal status prints
-try:
-    while True:
-        time.sleep(1)
-        if stop_all:
-            break
-except KeyboardInterrupt:
-    print("\n[INFO] KeyboardInterrupt: shutting down", flush=True)
-    stop_all = True
-    try:
-        if ws_kline: ws_kline.close()
-        if ws_user: ws_user.close()
-    except:
-        pass
-    sys.exit(0)
+t_poll = threadi
