@@ -203,7 +203,7 @@ def on_kline_message(ws, message):
                 return
             signal = check_signal_from_df(df)
             # protect last_processed_candle_time to avoid double entries
-            global last_processed_candle_time, in_position, position
+            global last_processed_candle_time, in_position, position, cooldown_until
             last_iso = pd.to_datetime(k.get('t'), unit='ms', utc=True).tz_convert('Asia/Kolkata').isoformat()
             # if cooldown active, skip
             if cooldown_until is not None and now_ist() < cooldown_until:
@@ -243,7 +243,7 @@ def on_kline_message(ws, message):
                             entry_price_actual = float(k.get('c'))
                         except:
                             entry_price_actual = entry_price
-                    # place TP/SL
+                    # place TP/SL (OCO-like with two orders)
                     tp_order, sl_order = place_tp_sl(SYMBOL, signal, LOT_SIZE, tp_price, sl_price)
                     position = {
                         'dir': signal,
@@ -440,9 +440,176 @@ def listenkey_keepalive_worker(lk):
             logging.debug(f"listenKey keepalive error: {e}")
             # continue and try again later
 
+# =================== NEW: MONITOR (poller) to detect TP/SL / manual close ===================
+def handle_detected_close(outcome, exit_price=None):
+    """
+    outcome: 'TP','SL','MANUAL'
+    exit_price: price or None
+    """
+    global in_position, position, cooldown_until, current_balance
+    try:
+        if not position:
+            return
+        entry_price = float(position.get('entry'))
+        dir_side = position.get('dir')
+        # If exit_price not provided, try to approximate by current ticker
+        if exit_price is None:
+            try:
+                ticker = exchange.fetch_ticker(SYMBOL)
+                exit_price = float(ticker.get('last') or ticker.get('close'))
+            except:
+                exit_price = entry_price
+        if dir_side == 'BUY':
+            pnl = (exit_price - entry_price) * LOT_SIZE
+        else:
+            pnl = (entry_price - exit_price) * LOT_SIZE
+
+        with balance_lock:
+            current_balance = fetch_usdt_balance()
+            bal = current_balance
+
+        rec = {
+            'time': position.get('entry_time').isoformat() if position.get('entry_time') else str(now_ist().isoformat()),
+            'dir': dir_side,
+            'entry': entry_price,
+            'exit': exit_price,
+            'outcome': outcome,
+            'pnl': round(pnl,6),
+            'balance': round(bal,6) if bal is not None else None
+        }
+        append_trade_csv(rec)
+        print(f"[{now_str()}] {outcome} detected by monitor. PnL: {round(pnl,6)} | Account USDT: {rec['balance']}", flush=True)
+        log.info(f"{outcome} detected by monitor. {rec}")
+
+        # cleanup and apply cooldown if SL
+        in_position = False
+        position = None
+        if outcome == 'SL':
+            cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
+            print(f"[{now_str()}] SL hit (monitor) → cooldown until {cooldown_until}", flush=True)
+            log.info(f"SL cooldown until {cooldown_until}")
+        else:
+            print(f"[{now_str()}] TP/manual close detected (monitor). Ready for next valid setup.", flush=True)
+    except Exception as e:
+        logging.debug(f"handle_detected_close error: {e}")
+
+def monitor_positions_poller(poll_interval=5):
+    """
+    Polls exchange to confirm if current position closed (TP/SL or manual).
+    Strategy:
+      1) If in_position True and position has tp_id or sl_id, try fetching those orders to see if filled.
+      2) If not found or not filled, fallback to position risk endpoint to see positionAmt for SYMBOL.
+      3) If positionAmt == 0 -> treat as closed (MANUAL if no order found).
+    """
+    global in_position, position, stop_all
+    while not stop_all:
+        try:
+            time.sleep(poll_interval)
+            if not in_position or not position:
+                continue
+
+            tp_id = position.get('tp_id')
+            sl_id = position.get('sl_id')
+
+            # 1) try to check TP/SL orders by id (best effort)
+            found_fill = False
+            if tp_id:
+                try:
+                    ord_tp = exchange.fetch_order(tp_id, SYMBOL)
+                    # ccxt status can be 'closed' or 'canceled' etc.
+                    status = (ord_tp.get('status') or '').lower()
+                    if status in ('closed','closed','filled','partially_filled','filled'):
+                        # check if filled fully
+                        if status in ('closed','filled'):
+                            exit_price = None
+                            # try to get average/price
+                            exit_price = ord_tp.get('average') or ord_tp.get('price') or (ord_tp.get('info') or {}).get('avgPrice')
+                            try:
+                                exit_price = float(exit_price) if exit_price is not None else None
+                            except:
+                                exit_price = None
+                            handle_detected_close('TP', exit_price)
+                            found_fill = True
+                except Exception:
+                    # ignore and continue
+                    pass
+            if found_fill:
+                continue
+
+            if sl_id:
+                try:
+                    ord_sl = exchange.fetch_order(sl_id, SYMBOL)
+                    status = (ord_sl.get('status') or '').lower()
+                    if status in ('closed','filled'):
+                        exit_price = ord_sl.get('average') or ord_sl.get('price') or (ord_sl.get('info') or {}).get('avgPrice')
+                        try:
+                            exit_price = float(exit_price) if exit_price is not None else None
+                        except:
+                            exit_price = None
+                        handle_detected_close('SL', exit_price)
+                        found_fill = True
+                except Exception:
+                    pass
+            if found_fill:
+                continue
+
+            # 2) fallback to position risk to detect if position size is zero
+            try:
+                pos_list = None
+                try:
+                    pos_list = exchange.fapiPrivate_get_positionrisk()
+                except Exception:
+                    pos_list = None
+                if not pos_list:
+                    # try ccxt fetch_positions
+                    try:
+                        pos_list = exchange.fetch_positions([SYMBOL])
+                    except Exception:
+                        pos_list = None
+                if pos_list:
+                    found = None
+                    for p in pos_list:
+                        # positionRisk returns 'symbol' like 'BNBUSDT'
+                        sym = p.get('symbol') or p.get('symbol', None)
+                        # ccxt fetch_positions may return 'symbol' as 'BNB/USDT'
+                        if sym:
+                            if isinstance(sym, str) and (sym.replace('USDT','/USDT') == SYMBOL.replace('/','') or sym == SYMBOL):
+                                found = p
+                                break
+                    if found:
+                        pos_amt = None
+                        if 'positionAmt' in found:
+                            try:
+                                pos_amt = float(found.get('positionAmt', 0))
+                            except:
+                                pos_amt = None
+                        elif isinstance(found.get('contracts', None), (int, float, str)):
+                            try:
+                                pos_amt = float(found.get('contracts', 0))
+                            except:
+                                pos_amt = None
+                        elif isinstance(found.get('amount', None), (int, float, str)):
+                            try:
+                                pos_amt = float(found.get('amount', 0))
+                            except:
+                                pos_amt = None
+                        # if closed (zero)
+                        if pos_amt is not None and abs(pos_amt) < 1e-8:
+                            # No order fill info available -> treat as MANUAL close
+                            handle_detected_close('MANUAL', exit_price=None)
+                            continue
+            except Exception as e:
+                logging.debug(f"monitor pos fallback error: {e}")
+                # continue and next poll
+
+        except Exception as e:
+            logging.debug(f"monitor_positions_poller error: {e}")
+            time.sleep(1)
+    # end while
+
 # =================== STARTUP ===================
-print(f"[{now_str()}] 🚀 [EMA LIVE BOT] {SYMBOL} | Binance Perpetual | FULL WebSocket Mode", flush=True)
-log.info("Starting full websocket EMA bot")
+print(f"[{now_str()}] 🚀 [EMA LIVE BOT] {SYMBOL} | Binance Perpetual | FULL WebSocket Mode (monitor active)", flush=True)
+log.info("Starting full websocket EMA bot with monitor")
 
 with balance_lock:
     current_balance = fetch_usdt_balance()
@@ -459,6 +626,9 @@ t_user.start()
 # start kline ws thread (daemon)
 t_kline = threading.Thread(target=start_kline_ws, daemon=True)
 t_kline.start()
+# start monitor thread (daemon)
+t_monitor = threading.Thread(target=monitor_positions_poller, kwargs={'poll_interval':5}, daemon=True)
+t_monitor.start()
 
 # set leverage once at startup (best-effort)
 try:
