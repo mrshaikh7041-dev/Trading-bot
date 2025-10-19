@@ -307,8 +307,9 @@ def main_loop():
 
                 tp_filled = False
                 sl_filled = False
+# ---------------- Monitor TP/SL Orders ----------------
                 monitor_start = time.time()
-                MONITOR_TIMEOUT = 60 * 60
+                MONITOR_TIMEOUT = 60 * 60  # 1 hour
 
                 while True:
                     time.sleep(POLL_INTERVAL_SECONDS)
@@ -318,37 +319,48 @@ def main_loop():
                     open_orders = fetch_open_orders_for_symbol()
                     open_ids = {str(o.get('id') or (o.get('info') or {}).get('orderId')) for o in open_orders}
 
-                    if sl_id and str(sl_id) not in open_ids:
-                        sl_filled = True
-                    if tp_id and str(tp_id) not in open_ids:
-                        tp_filled = True
+                    if not open_orders:
+                        # check if position closed
+                        pos_size = get_position_size_for_symbol()
+                        ticker = exchange.fetch_ticker(SYMBOL)
+                        current_price = float(ticker['last'])
 
-                    if tp_filled or sl_filled:
-                        outcome = 'TP' if tp_filled else 'SL'
-                        if tp_filled and sl_id: cancel_order_by_id(sl_id)
-                        if sl_filled and tp_id: cancel_order_by_id(tp_id)
+                        if abs(pos_size) < 0.0001:  # position closed
+                            outcome = None
+                            if signal == "BUY":
+                                if current_price <= sl_price + 0.5:  # small tolerance
+                                    outcome = 'SL'
+                                elif current_price >= tp_price - 0.5:
+                                    outcome = 'TP'
+                            elif signal == "SELL":
+                                if current_price >= sl_price - 0.5:
+                                    outcome = 'SL'
+                                elif current_price <= tp_price + 0.5:
+                                    outcome = 'TP'
 
-                        pnl = TP_POINTS * LOT_SIZE if tp_filled else -SL_POINTS * LOT_SIZE
-                        rec = {
-                            'time': now_ist().isoformat(),
-                            'dir': signal,
-                            'entry': entry_price,
-                            'exit': None,
-                            'outcome': outcome,
-                            'pnl': pnl,
-                            'balance': get_usdt_balance(),
-                            'entry_order_id': entry_id,
-                            'tp_order_id': tp_id,
-                            'sl_order_id': sl_id
-                        }
-                        append_trade_csv(rec)
-                        print(f"[{now_str()}] {outcome} hit. PnL {pnl}", flush=True)
+                            if not outcome:
+                                outcome = 'UNKNOWN'
 
-                        # ✅ apply cooldown only if SL
-                        if outcome == 'SL':
-                            cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
-                            print(f"[{now_str()}] Cooldown activated for {COOLDOWN_MINUTES} minutes after SL.", flush=True)
-                        break
+                            pnl = TP_POINTS * LOT_SIZE if outcome == 'TP' else -SL_POINTS * LOT_SIZE if outcome == 'SL' else 0.0
+                            rec = {
+                                'time': now_ist().isoformat(),
+                                'dir': signal,
+                                'entry': entry_price,
+                                'exit': current_price,
+                                'outcome': outcome,
+                                'pnl': pnl,
+                                'balance': get_usdt_balance(),
+                                'entry_order_id': entry_id,
+                                'tp_order_id': tp_id,
+                                'sl_order_id': sl_id
+                            }
+                            append_trade_csv(rec)
+                            print(f"[{now_str()}] {outcome} hit. PnL {pnl}", flush=True)
+
+                            if outcome == 'SL':
+                                cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
+                                print(f"[{now_str()}] Cooldown activated for {COOLDOWN_MINUTES} minutes after SL.", flush=True)
+                            break
 
             except Exception as e:
                 print(f"[{now_str()}] Error: {e}", flush=True)
