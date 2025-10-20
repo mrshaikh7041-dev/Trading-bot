@@ -1,373 +1,194 @@
-# live_ema_binance_futures.py
-"""
-Robust live EMA futures bot using ccxt (Binance USDT-M futures).
-Replace API_KEY / API_SECRET and test in a demo account / testnet first.
-"""
-
+# live_binance_futures_bot_clean.py
 import ccxt
 import pandas as pd
 import time
-from datetime import datetime, timedelta, timezone
+import threading
 import traceback
-import os
-import csv
 import logging
-import sys
+from datetime import datetime, timedelta
 
-# =================== CONFIG ===================
-API_KEY = 'czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ'        # <-- put your API key
-API_SECRET = 'cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO'  # <-- put your secret
-SYMBOL = 'BNB/USDT'
-TIMEFRAME = '1m'
-LOT_SIZE = 0.01
+# ================= CONFIG =================
+API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"    # 🔒 Hardcoded as requested
+API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
+
+SYMBOL = "BNBUSDT"               # Binance Futures symbol (no slash)
+TIMEFRAME = "1m"
+EMA_SET = [10, 20, 50, 100]
+
+LOT_SIZE = 0.01                  # BNB quantity
+TP_POINTS = 6.0                  # absolute points
 SL_POINTS = 3.0
-TP_POINTS = 6.0
 LEVERAGE = 75
-POLL_INTERVAL_SECONDS = 5
-CSV_FN = f'{SYMBOL.replace("/", "-")}_live_trades.csv'
-LOG_FILE = 'bot_live.log'
+COOLDOWN_MINUTES = 30
+POLL_INTERVAL = 5                # seconds between checks
 
-# ✅ Added cooldown config
-COOLDOWN_MINUTES = 30  # cooldown only after SL hit
+# =========================================================
 
-# =================== LOGGING SETUP ===================
 logging.basicConfig(
-    filename=LOG_FILE,
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger(__name__)
 
-# =================== EXCHANGE (FUTURES) ===================
 exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': API_SECRET,
     'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
+    'options': {'defaultType': 'future'},
+    'timeout': 30000,
 })
 
-try:
-    exchange.load_markets()
-except Exception as e:
-    print(f"[WARN] load_markets failed: {e}", flush=True)
-    log.warning(f"load_markets failed: {e}")
+def safe_sleep(sec):
+    try:
+        time.sleep(sec)
+    except KeyboardInterrupt:
+        raise
 
-# =================== STATE ===================
-last_processed_candle_time = None
-cooldown_until = None  # ✅ added global cooldown tracker
+def now():
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-# =================== TIME ===================
-KOLKATA = timezone(timedelta(hours=5, minutes=30))
-def now_ist():
-    return datetime.now(timezone.utc).astimezone(KOLKATA)
-def now_str():
-    return now_ist().strftime('%Y-%m-%d %H:%M:%S %Z')
-
-# =================== HELPERS ===================
-def fetch_latest_candles(symbol, timeframe, limit=200):
+# ================= STRATEGY =================
+def fetch_latest_data(symbol, timeframe, limit=200):
+    """Fetch recent candles"""
     try:
         bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if not bars or len(bars) < 10:
-            return None
-        df = pd.DataFrame(bars, columns=['time','open','high','low','close','volume'])
-        df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True).dt.tz_convert('Asia/Kolkata')
+        df = pd.DataFrame(bars, columns=["time", "open", "high", "low", "close", "volume"])
+        df['time'] = pd.to_datetime(df['time'], unit='ms') + timedelta(hours=5, minutes=30)
         return df
     except Exception as e:
-        log.error(f'Fetch candles failed: {e}')
-        print(f"[{now_str()}] Fetch candles failed: {e}", flush=True)
-        return None
+        logging.warning(f"Data fetch error: {e}")
+        return pd.DataFrame()
 
-def compute_emas(df):
+def apply_ema_strategy(df, ema_set):
+    """Same logic as backtest, simplified for live"""
     df = df.copy()
-    df['ema5'] = df['close'].ewm(span=5, adjust=False).mean()
-    df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['ema15'] = df['close'].ewm(span=15, adjust=False).mean()
-    df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
-    return df
-
-def check_signal(candle):
-    try:
-        c = float(candle['close'])
-        l = float(candle['low'])
-        h = float(candle['high'])
-        ema5 = float(candle['ema5'])
-        ema9 = float(candle['ema9'])
-        ema15 = float(candle['ema15'])
-        ema21 = float(candle['ema21'])
-    except Exception:
+    for span in ema_set:
+        df[f"ema{span}"] = df["close"].ewm(span=span, adjust=False).mean()
+    signal = None
+    if len(df) < max(ema_set) + 2:
         return None
+    c, h, l = df.iloc[-1][["close", "high", "low"]]
+    emas = [df.iloc[-1][f"ema{e}"] for e in ema_set]
+    if all(c > e for e in emas):
+        signal = "BUY"
+    elif all(c < e for e in emas):
+        signal = "SELL"
+    elif l <= emas[len(emas)//2] <= h:
+        if c > emas[len(emas)//2]:
+            signal = "BUY"
+        elif c < emas[len(emas)//2]:
+            signal = "SELL"
+    return signal
 
-    if c >= ema5 and c >= ema9 and c >= ema15 and c > ema21:
-        return 'BUY'
-    if c <= ema5 and c <= ema9 and c <= ema15 and c < ema21:
-        return 'SELL'
-    if l <= ema15 <= h and c > ema5:
-        return 'BUY'
-    if l <= ema15 <= h and c < ema5:
-        return 'SELL'
-    return None
+# ================= MONITOR =================
+class PositionMonitor:
+    def __init__(self):
+        self.in_position = False
+        self.side = None
+        self.entry_price = None
+        self.cooldown_until = None
 
-def append_trade_csv(record):
-    header = ['time','dir','entry','exit','outcome','pnl','balance','entry_order_id','tp_order_id','sl_order_id']
-    file_exists = os.path.isfile(CSV_FN)
-    try:
-        with open(CSV_FN, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=header)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(record)
-    except Exception as e:
-        log.error(f'append_trade_csv failed: {e}')
+    def set_position(self, side, entry_price):
+        self.in_position = True
+        self.side = side
+        self.entry_price = entry_price
+        logging.info(f"✅ Position OPENED | {side} @ {entry_price}")
 
-def get_usdt_balance():
-    try:
-        bal = exchange.fetch_balance()
-        totals = bal.get('total', {})
-        if isinstance(totals, dict):
-            for k,v in totals.items():
-                if str(k).upper() == 'USDT':
-                    return float(v or 0.0)
-        info = bal.get('info') or {}
-        if isinstance(info, dict):
-            if 'totalWalletBalance' in info:
-                return float(info.get('totalWalletBalance') or 0.0)
-            assets = info.get('assets') or info.get('positions') or []
-            if isinstance(assets, list):
-                for a in assets:
-                    if a.get('asset') == 'USDT':
-                        return float(a.get('walletBalance') or a.get('balance') or 0.0)
-        return 0.0
-    except Exception as e:
-        log.error(f'fetch_balance error: {e}')
-        print(f"[{now_str()}] fetch_balance error: {e}", flush=True)
-        return 0.0
+    def clear_position(self, reason="Closed"):
+        logging.info(f"❌ Position CLOSED ({reason})")
+        self.in_position = False
+        self.side = None
+        self.entry_price = None
+        self.cooldown_until = now() + timedelta(minutes=COOLDOWN_MINUTES)
+        logging.info(f"🕒 Cooldown active until {self.cooldown_until}")
 
+    def can_trade(self):
+        if self.cooldown_until and now() < self.cooldown_until:
+            return False
+        return not self.in_position
+
+monitor = PositionMonitor()
+
+# ================= BINANCE HELPERS =================
 def set_leverage(symbol, leverage):
     try:
-        symbol_no_slash = symbol.replace('/', '')
-        if hasattr(exchange, 'fapiPrivate_post_leverage'):
-            resp = exchange.fapiPrivate_post_leverage({'symbol': symbol_no_slash, 'leverage': int(leverage)})
-            log.info(f'Leverage set response: {resp}')
-            print(f"[{now_str()}] Leverage set to {leverage}", flush=True)
-        else:
-            print(f"[{now_str()}] Leverage set API not available; skipping.", flush=True)
+        exchange.set_leverage(leverage, symbol)
+        logging.info(f"Leverage set to {leverage}x for {symbol}")
     except Exception as e:
-        log.error(f'Could not set leverage: {e}')
-        print(f"[{now_str()}] Warning: Could not set leverage via API: {e}", flush=True)
+        logging.warning(f"Leverage set error: {e}")
 
-def place_market_entry(side, amount):
+def place_market_entry(symbol, side, qty):
+    return exchange.create_order(symbol, 'MARKET', side, qty)
+
+def place_reduce_only_orders(symbol, side, qty, entry_price):
+    """Set TP/SL reduce-only"""
+    tp = entry_price + TP_POINTS if side == "BUY" else entry_price - TP_POINTS
+    sl = entry_price - SL_POINTS if side == "BUY" else entry_price + SL_POINTS
+
+    params_tp = {'stopPrice': tp, 'reduceOnly': True}
+    params_sl = {'stopPrice': sl, 'reduceOnly': True}
+    tp_side = "SELL" if side == "BUY" else "BUY"
+    sl_side = "SELL" if side == "BUY" else "BUY"
+
     try:
-        side_str = 'buy' if side == 'BUY' else 'sell'
-        order = exchange.create_order(symbol=SYMBOL, type='market', side=side_str, amount=amount, params={})
-        return order
+        exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', tp_side, qty, None, params_tp)
+        exchange.create_order(symbol, 'STOP_MARKET', sl_side, qty, None, params_sl)
+        logging.info(f"🎯 TP: {tp} | 🛑 SL: {sl}")
     except Exception as e:
-        log.error(f'Entry order failed: {e}')
-        print(f"[{now_str()}] Entry order failed: {e}", flush=True)
-        return None
+        logging.error(f"TP/SL placement error: {e}")
 
-def place_tp_sl_orders(side, amount, tp_price, sl_price):
-    tp_order = None
-    sl_order = None
-    try:
-        tp_side = 'sell' if side == 'BUY' else 'buy'
-        sl_side = 'sell' if side == 'BUY' else 'buy'
-
-        try:
-            tp_order = exchange.create_order(
-                symbol=SYMBOL,
-                type='limit',
-                side=tp_side,
-                amount=amount,
-                price=tp_price,
-                params={'reduceOnly': True, 'timeInForce': 'GTC'}
-            )
-        except Exception as e:
-            log.warning(f'TP order creation failed: {e}')
-
-        try:
-            sl_order = exchange.create_order(
-                symbol=SYMBOL,
-                type='STOP_MARKET',
-                side=sl_side,
-                amount=amount,
-                params={'stopPrice': sl_price, 'reduceOnly': True}
-            )
-        except Exception as e:
-            log.warning(f'SL order creation failed: {e}')
-
-        return {'tp_order': tp_order, 'sl_order': sl_order}
-    except Exception as e:
-        log.error(f'place_tp_sl_orders error: {e}')
-        return {'tp_order': tp_order, 'sl_order': sl_order}
-
-def fetch_open_orders_for_symbol():
-    try:
-        return exchange.fetch_open_orders(symbol=SYMBOL)
-    except Exception as e:
-        log.error(f'fetch_open_orders failed: {e}')
-        return []
-
-def cancel_order_by_id(order_id):
-    try:
-        return exchange.cancel_order(order_id, SYMBOL)
-    except Exception as e:
-        log.error(f'cancel_order {order_id} failed: {e}')
-        return None
-
-def get_position_size_for_symbol():
-    try:
-        if hasattr(exchange, 'fetch_positions'):
-            try:
-                positions = exchange.fetch_positions([SYMBOL])
-                for p in positions:
-                    if p.get('symbol') == SYMBOL or p.get('info', {}).get('symbol') == SYMBOL.replace('/', ''):
-                        size = float(p.get('contracts', 0) or p.get('size', 0) or p.get('amount', 0) or p.get('positionAmt', 0) or 0)
-                        return size
-            except Exception:
-                pass
-        sym = SYMBOL.replace('/','')
-        resp = exchange.fapiPrivate_get_positionrisk({'symbol': sym})
-        if isinstance(resp, list):
-            for r in resp:
-                if r.get('symbol') == sym:
-                    return float(r.get('positionAmt', 0) or 0)
-        return 0.0
-    except Exception as e:
-        log.error(f'get_position_size error: {e}')
-        return 0.0
-
-def parse_order_id(order):
-    if not order: return None
-    if isinstance(order, dict):
-        if order.get('id'): return order.get('id')
-        info = order.get('info') or {}
-        return info.get('orderId') or info.get('order_id') or info.get('id')
-    return None
-
-# =================== MAIN LOOP ===================
-def main_loop():
-    global last_processed_candle_time, cooldown_until
-
-    print(f"[{now_str()}] Starting LIVE EMA Futures Bot ({SYMBOL}) | Leverage={LEVERAGE}", flush=True)
+# ================= MAIN LOOP =================
+def run_bot():
     set_leverage(SYMBOL, LEVERAGE)
+    logging.info("🚀 Live bot started. Waiting for signals...")
 
-    try:
-        while True:
-            try:
-                # ✅ check cooldown
-                if cooldown_until and now_ist() < cooldown_until:
-                    remaining = (cooldown_until - now_ist()).total_seconds() / 60
-                    print(f"[{now_str()}] In cooldown for {remaining:.1f} min after SL. Skipping entries.", flush=True)
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
+    while True:
+        try:
+            if not monitor.can_trade():
+                logging.info("⏸ In cooldown or open position. Waiting...")
+                safe_sleep(POLL_INTERVAL)
+                continue
 
-                df = fetch_latest_candles(SYMBOL, TIMEFRAME, 200)
-                if df is None or len(df) < 12:
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
+            df = fetch_latest_data(SYMBOL, TIMEFRAME)
+            if df.empty:
+                safe_sleep(POLL_INTERVAL)
+                continue
 
-                df = compute_emas(df)
+            signal = apply_ema_strategy(df, EMA_SET)
+            if not signal:
+                safe_sleep(POLL_INTERVAL)
+                continue
 
-                pos_size = get_position_size_for_symbol()
-                open_orders = fetch_open_orders_for_symbol()
-                if abs(pos_size) > 0 or len(open_orders) > 0:
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
+            ticker = exchange.fetch_ticker(SYMBOL)
+            price = float(ticker['last'])
+            logging.info(f"📊 Signal: {signal} | Price: {price}")
 
-                last_closed = df.iloc[-2]
-                live_candle = df.iloc[-1]
-                next_open = float(live_candle['open'])
-                last_closed_time_iso = str(last_closed['time'].isoformat())
+            # Place market entry
+            order = place_market_entry(SYMBOL, signal, LOT_SIZE)
+            entry_price = price
+            monitor.set_position(signal, entry_price)
 
-                signal = check_signal(last_closed)
-                if not signal:
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
+            # Place TP/SL reduceOnly
+            place_reduce_only_orders(SYMBOL, signal, LOT_SIZE, entry_price)
 
-                if last_processed_candle_time == last_closed_time_iso:
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                usdt_bal = get_usdt_balance()
-                entry_order = place_market_entry(signal, LOT_SIZE)
-                if not entry_order:
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                entry_price = float(entry_order.get('average') or entry_order.get('price') or next_open)
-                tp_price = entry_price + TP_POINTS if signal == "BUY" else entry_price - TP_POINTS
-                sl_price = entry_price - SL_POINTS if signal == "BUY" else entry_price + SL_POINTS
-
-                placement = place_tp_sl_orders(signal, LOT_SIZE, tp_price, sl_price)
-                tp_order, sl_order = placement.get('tp_order'), placement.get('sl_order')
-                tp_id, sl_id, entry_id = parse_order_id(tp_order), parse_order_id(sl_order), parse_order_id(entry_order)
-
-                last_processed_candle_time = last_closed_time_iso
-                print(f"[{now_str()}] Entry placed @ {entry_price} | TP={tp_price} SL={sl_price}", flush=True)
-
-                tp_filled = False
-                sl_filled = False
-# ---------------- Monitor TP/SL Orders ----------------
-                monitor_start = time.time()
-                MONITOR_TIMEOUT = 60 * 60  # 1 hour
-
-                while True:
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    if time.time() - monitor_start > MONITOR_TIMEOUT:
+            # Monitor position until closed
+            while monitor.in_position:
+                try:
+                    pos = exchange.fetch_positions([SYMBOL])
+                    found = next((p for p in pos if p['symbol'] == SYMBOL and abs(float(p['contracts'])) > 0), None)
+                    if not found:
+                        monitor.clear_position("TP/SL hit")
                         break
+                except Exception as e:
+                    logging.warning(f"Position check error: {e}")
+                safe_sleep(10)
 
-                    open_orders = fetch_open_orders_for_symbol()
-                    open_ids = {str(o.get('id') or (o.get('info') or {}).get('orderId')) for o in open_orders}
+        except KeyboardInterrupt:
+            logging.info("🛑 Bot stopped manually.")
+            break
+        except Exception as e:
+            logging.error(f"Main loop error: {e}\n{traceback.format_exc()}")
+            safe_sleep(5)
 
-                    if not open_orders:
-                        # check if position closed
-                        pos_size = get_position_size_for_symbol()
-                        ticker = exchange.fetch_ticker(SYMBOL)
-                        current_price = float(ticker['last'])
-
-                        if abs(pos_size) < 0.0001:  # position closed
-                            outcome = None
-                            if signal == "BUY":
-                                if current_price <= sl_price + 0.5:  # small tolerance
-                                    outcome = 'SL'
-                                elif current_price >= tp_price - 0.5:
-                                    outcome = 'TP'
-                            elif signal == "SELL":
-                                if current_price >= sl_price - 0.5:
-                                    outcome = 'SL'
-                                elif current_price <= tp_price + 0.5:
-                                    outcome = 'TP'
-
-                            if not outcome:
-                                outcome = 'UNKNOWN'
-
-                            pnl = TP_POINTS * LOT_SIZE if outcome == 'TP' else -SL_POINTS * LOT_SIZE if outcome == 'SL' else 0.0
-                            rec = {
-                                'time': now_ist().isoformat(),
-                                'dir': signal,
-                                'entry': entry_price,
-                                'exit': current_price,
-                                'outcome': outcome,
-                                'pnl': pnl,
-                                'balance': get_usdt_balance(),
-                                'entry_order_id': entry_id,
-                                'tp_order_id': tp_id,
-                                'sl_order_id': sl_id
-                            }
-                            append_trade_csv(rec)
-                            print(f"[{now_str()}] {outcome} hit. PnL {pnl}", flush=True)
-
-                            if outcome == 'SL':
-                                cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
-                                print(f"[{now_str()}] Cooldown activated for {COOLDOWN_MINUTES} minutes after SL.", flush=True)
-                            break
-
-            except Exception as e:
-                print(f"[{now_str()}] Error: {e}", flush=True)
-                log.error(traceback.format_exc())
-                time.sleep(5)
-    except KeyboardInterrupt:
-        print("Bot stopped by user.", flush=True)
-
-if __name__ == '__main__':
-    main_loop()
+if __name__ == "__main__":
+    run_bot()
