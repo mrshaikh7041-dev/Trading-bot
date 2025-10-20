@@ -1,34 +1,24 @@
-# live_binance_futures_bot_clean.py
+# live_binance_futures_bot_ready.py
 import ccxt
 import pandas as pd
-import time
-import threading
-import traceback
-import logging
+import time, traceback, logging
 from datetime import datetime, timedelta
 
-# ================= CONFIG =================
-API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"    # 🔒 Hardcoded as requested
+# ------------- CONFIG -------------
+API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
 API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
-
-SYMBOL = "BNBUSDT"               # Binance Futures symbol (no slash)
+SYMBOL = "BNB/USDT"        # unified pair format
 TIMEFRAME = "1m"
-EMA_SET = [10, 20, 50, 100]
-
-LOT_SIZE = 0.01                  # BNB quantity
-TP_POINTS = 6.0                  # absolute points
+EMA_SET = [10,20,50,100]
+LOT_SIZE = 0.01
+TP_POINTS = 6.0
 SL_POINTS = 3.0
 LEVERAGE = 75
 COOLDOWN_MINUTES = 30
-POLL_INTERVAL = 5                # seconds between checks
+POLL_INTERVAL = 5
+# ----------------------------------
 
-# =========================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 exchange = ccxt.binance({
     'apiKey': API_KEY,
@@ -38,157 +28,159 @@ exchange = ccxt.binance({
     'timeout': 30000,
 })
 
-def safe_sleep(sec):
-    try:
-        time.sleep(sec)
-    except KeyboardInterrupt:
-        raise
+def now(): return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-def now():
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+def safe_sleep(s): 
+    try: time.sleep(s)
+    except KeyboardInterrupt: raise
 
-# ================= STRATEGY =================
-def fetch_latest_data(symbol, timeframe, limit=200):
-    """Fetch recent candles"""
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(bars, columns=["time", "open", "high", "low", "close", "volume"])
-        df['time'] = pd.to_datetime(df['time'], unit='ms') + timedelta(hours=5, minutes=30)
-        return df
-    except Exception as e:
-        logging.warning(f"Data fetch error: {e}")
-        return pd.DataFrame()
-
-def apply_ema_strategy(df, ema_set):
-    """Same logic as backtest, simplified for live"""
-    df = df.copy()
-    for span in ema_set:
-        df[f"ema{span}"] = df["close"].ewm(span=span, adjust=False).mean()
-    signal = None
-    if len(df) < max(ema_set) + 2:
-        return None
-    c, h, l = df.iloc[-1][["close", "high", "low"]]
-    emas = [df.iloc[-1][f"ema{e}"] for e in ema_set]
-    if all(c > e for e in emas):
-        signal = "BUY"
-    elif all(c < e for e in emas):
-        signal = "SELL"
-    elif l <= emas[len(emas)//2] <= h:
-        if c > emas[len(emas)//2]:
-            signal = "BUY"
-        elif c < emas[len(emas)//2]:
-            signal = "SELL"
-    return signal
-
-# ================= MONITOR =================
-class PositionMonitor:
-    def __init__(self):
-        self.in_position = False
-        self.side = None
-        self.entry_price = None
-        self.cooldown_until = None
-
-    def set_position(self, side, entry_price):
-        self.in_position = True
-        self.side = side
-        self.entry_price = entry_price
-        logging.info(f"✅ Position OPENED | {side} @ {entry_price}")
-
-    def clear_position(self, reason="Closed"):
-        logging.info(f"❌ Position CLOSED ({reason})")
-        self.in_position = False
-        self.side = None
-        self.entry_price = None
-        self.cooldown_until = now() + timedelta(minutes=COOLDOWN_MINUTES)
-        logging.info(f"🕒 Cooldown active until {self.cooldown_until}")
-
-    def can_trade(self):
-        if self.cooldown_until and now() < self.cooldown_until:
-            return False
-        return not self.in_position
-
-monitor = PositionMonitor()
-
-# ================= BINANCE HELPERS =================
+# ----- helpers for leverage (robust) -----
 def set_leverage(symbol, leverage):
     try:
-        exchange.set_leverage(leverage, symbol)
-        logging.info(f"Leverage set to {leverage}x for {symbol}")
+        # try unified helper first (may exist)
+        if hasattr(exchange, 'set_leverage'):
+            exchange.set_leverage(leverage, symbol)
+        else:
+            # fallback to raw fapi endpoint (Binance USDM)
+            exchange.fapiPrivate_post_leverage({'symbol': symbol.replace('/',''), 'leverage': int(leverage)})
+        logging.info("Leverage set %sx for %s", leverage, symbol)
     except Exception as e:
-        logging.warning(f"Leverage set error: {e}")
+        logging.warning("set_leverage failed: %s", e)
 
-def place_market_entry(symbol, side, qty):
-    return exchange.create_order(symbol, 'MARKET', side, qty)
+# ----- fetch candles & EMA -----
+def fetch_ohlcv_df(symbol, timeframe, limit=200):
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(bars, columns=["time","open","high","low","close","volume"])
+    df['time'] = pd.to_datetime(df['time'], unit='ms') + timedelta(hours=5, minutes=30)
+    return df
 
-def place_reduce_only_orders(symbol, side, qty, entry_price):
-    """Set TP/SL reduce-only"""
-    tp = entry_price + TP_POINTS if side == "BUY" else entry_price - TP_POINTS
-    sl = entry_price - SL_POINTS if side == "BUY" else entry_price + SL_POINTS
+def get_signal(df):
+    for s in EMA_SET:
+        df[f"ema{s}"] = df['close'].ewm(span=s, adjust=False).mean()
+    if len(df) < max(EMA_SET)+2: 
+        return None
+    r = df.iloc[-1]
+    c,h,l = r['close'], r['high'], r['low']
+    emas = [r[f"ema{e}"] for e in EMA_SET]
+    if all(c > e for e in emas): return "BUY"
+    if all(c < e for e in emas): return "SELL"
+    if l <= emas[len(emas)//2] <= h:
+        return "BUY" if c > emas[len(emas)//2] else "SELL" if c < emas[len(emas)//2] else None
+    return None
 
-    params_tp = {'stopPrice': tp, 'reduceOnly': True}
-    params_sl = {'stopPrice': sl, 'reduceOnly': True}
-    tp_side = "SELL" if side == "BUY" else "BUY"
-    sl_side = "SELL" if side == "BUY" else "BUY"
-
+# ----- place market entry (unified) -----
+def place_market(symbol, side, qty):
+    # ccxt signature: create_order(symbol, type, side, amount, price=None, params={})
     try:
-        exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', tp_side, qty, None, params_tp)
-        exchange.create_order(symbol, 'STOP_MARKET', sl_side, qty, None, params_sl)
-        logging.info(f"🎯 TP: {tp} | 🛑 SL: {sl}")
+        return exchange.create_order(symbol, 'MARKET', side, qty)
     except Exception as e:
-        logging.error(f"TP/SL placement error: {e}")
+        logging.error("Market order failed: %s", e)
+        raise
 
-# ================= MAIN LOOP =================
-def run_bot():
+# ----- place TP/SL (reduceOnly) with fallback -----
+def place_tp_sl(symbol, side, qty, entry_price, tp_points, sl_points):
+    tp_price = entry_price + tp_points if side == 'BUY' else entry_price - tp_points
+    sl_price = entry_price - sl_points if side == 'BUY' else entry_price + sl_points
+    tp_side = 'SELL' if side=='BUY' else 'BUY'
+    sl_side = tp_side
+    # try via ccxt create_order with type=TAKE_PROFIT_MARKET / STOP_MARKET
+    params_tp = {'stopPrice': float(tp_price), 'reduceOnly': True}
+    params_sl = {'stopPrice': float(sl_price), 'reduceOnly': True}
+    try:
+        o1 = exchange.create_order(symbol, 'TAKE_PROFIT_MARKET', tp_side, qty, None, params_tp)
+        o2 = exchange.create_order(symbol, 'STOP_MARKET', sl_side, qty, None, params_sl)
+        logging.info("Placed TP and SL via unified create_order")
+        return o1,o2
+    except Exception as e:
+        logging.warning("Unified TP/SL failed: %s - trying raw endpoints", e)
+        # Raw POST to fapi/v1/order
+        try:
+            s = symbol.replace('/','')
+            # TAKE_PROFIT_MARKET
+            tp_payload = {'symbol': s, 'side': tp_side, 'type': 'TAKE_PROFIT_MARKET', 'quantity': qty, 'stopPrice': tp_price, 'reduceOnly': 'true', 'timestamp': exchange.milliseconds()}
+            sl_payload = {'symbol': s, 'side': sl_side, 'type': 'STOP_MARKET', 'quantity': qty, 'stopPrice': sl_price, 'reduceOnly': 'true', 'timestamp': exchange.milliseconds()}
+            o1 = exchange.fapiPrivate_post_order(tp_payload)
+            o2 = exchange.fapiPrivate_post_order(sl_payload)
+            logging.info("Placed TP/SL via raw fapi endpoints")
+            return o1,o2
+        except Exception as e2:
+            logging.error("Raw TP/SL placement failed: %s", e2)
+            raise
+
+# ----- robust position check (multi-shape) -----
+def is_position_open(symbol):
+    # try fetch_positions unified
+    try:
+        if hasattr(exchange, 'fetch_positions'):
+            positions = exchange.fetch_positions([symbol])
+            for p in positions:
+                # p may be dict with 'symbol' or 'info' sub-dict
+                s = p.get('symbol') or (p.get('info') or {}).get('symbol')
+                contracts = p.get('contracts') or float((p.get('info') or {}).get('positionAmt') or 0)
+                if s and s.replace('/','') == symbol.replace('/','') and abs(float(contracts)) > 0:
+                    return True
+        # fallback: fetch_balance info positions
+        bal = exchange.fetch_balance(params={})
+        info = bal.get('info', {})
+        for pos in info.get('positions', []):
+            if pos.get('symbol') == symbol.replace('/','') and float(pos.get('positionAmt',0)) != 0:
+                return True
+    except Exception as e:
+        logging.debug("position check error: %s", e)
+    return False
+
+# ----- main loop -----
+def run():
     set_leverage(SYMBOL, LEVERAGE)
-    logging.info("🚀 Live bot started. Waiting for signals...")
+    logging.info("Bot started")
+    in_position = False
+    cooldown_until = None
 
     while True:
         try:
-            if not monitor.can_trade():
-                logging.info("⏸ In cooldown or open position. Waiting...")
-                safe_sleep(POLL_INTERVAL)
-                continue
+            if cooldown_until and datetime.utcnow() + timedelta(hours=5,minutes=30) < cooldown_until:
+                logging.info("Cooldown active until %s", cooldown_until); safe_sleep(POLL_INTERVAL); continue
 
-            df = fetch_latest_data(SYMBOL, TIMEFRAME)
+            # ensure no open position already (external changes)
+            if is_position_open(SYMBOL):
+                logging.info("Detected existing live position -> waiting until closed")
+                safe_sleep(10); continue
+
+            df = fetch_ohlcv_df(SYMBOL, TIMEFRAME)
             if df.empty:
-                safe_sleep(POLL_INTERVAL)
-                continue
-
-            signal = apply_ema_strategy(df, EMA_SET)
+                safe_sleep(POLL_INTERVAL); continue
+            signal = get_signal(df)
             if not signal:
-                safe_sleep(POLL_INTERVAL)
-                continue
+                safe_sleep(POLL_INTERVAL); continue
 
             ticker = exchange.fetch_ticker(SYMBOL)
-            price = float(ticker['last'])
-            logging.info(f"📊 Signal: {signal} | Price: {price}")
+            price = float(ticker.get('last') or ticker.get('close'))
+            logging.info("Signal %s @ price %s", signal, price)
 
-            # Place market entry
-            order = place_market_entry(SYMBOL, signal, LOT_SIZE)
-            entry_price = price
-            monitor.set_position(signal, entry_price)
-
-            # Place TP/SL reduceOnly
-            place_reduce_only_orders(SYMBOL, signal, LOT_SIZE, entry_price)
-
-            # Monitor position until closed
-            while monitor.in_position:
+            # market entry
+            place_market(SYMBOL, signal, LOT_SIZE)
+            # place TP/SL
+            try:
+                place_tp_sl(SYMBOL, signal, LOT_SIZE, price, TP_POINTS, SL_POINTS)
+            except Exception:
+                # If TP/SL placement failed, try to close immediately to avoid unprotected position
+                logging.error("TP/SL placement failed, trying to close position immediately")
+                close_side = 'SELL' if signal=='BUY' else 'BUY'
                 try:
-                    pos = exchange.fetch_positions([SYMBOL])
-                    found = next((p for p in pos if p['symbol'] == SYMBOL and abs(float(p['contracts'])) > 0), None)
-                    if not found:
-                        monitor.clear_position("TP/SL hit")
-                        break
+                    exchange.create_order(SYMBOL, 'MARKET', close_side, LOT_SIZE)
                 except Exception as e:
-                    logging.warning(f"Position check error: {e}")
-                safe_sleep(10)
+                    logging.error("Forced close failed: %s", e)
+            # wait until closed
+            while is_position_open(SYMBOL):
+                safe_sleep(5)
+            # set cooldown (apply always; you can refine to check whether it was SL specifically)
+            cooldown_until = datetime.utcnow() + timedelta(hours=5,minutes=30) + timedelta(minutes=COOLDOWN_MINUTES)
+            logging.info("Position closed; cooldown until %s", cooldown_until)
 
         except KeyboardInterrupt:
-            logging.info("🛑 Bot stopped manually.")
-            break
+            logging.info("Stopped by user"); break
         except Exception as e:
-            logging.error(f"Main loop error: {e}\n{traceback.format_exc()}")
-            safe_sleep(5)
+            logging.error("Loop error: %s\n%s", e, traceback.format_exc()); safe_sleep(5)
 
 if __name__ == "__main__":
-    run_bot()
+    run()
