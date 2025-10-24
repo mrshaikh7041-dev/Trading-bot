@@ -202,7 +202,7 @@ async def main_loop():
             prev_candle = last_candle
             last_candle = live_candle
             # Update EMA100
-            df = df.append(pd.DataFrame([live_candle]))
+            df = pd.concat([df, pd.DataFrame([live_candle])], ignore_index=True)
             if len(df)>100: df=df.iloc[-100:]
             ema100 = compute_ema(df, period=100)
 
