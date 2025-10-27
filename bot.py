@@ -14,7 +14,7 @@ import traceback
 # =================== CONFIG ===================
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1m'
-LOT_SIZE = 0.01
+LOT_SIZE = 0.02
 TP_POINTS = 30
 SL_POINTS = 15
 LEVERAGE = 75
@@ -23,7 +23,7 @@ LIVE_MODE = 'off'          # 'on' = live trading
 SIMULATION_MODE = 'on'     # 'on' = paper trading
 PAPER_BALANCE = 2.0        # simulation balance
 COOLDOWN_MINUTES = 30
-INTRABAR_STEPS = 30
+INTRABAR_STEPS = 50
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
 LOG_FILE = 'bot.log'
 FEE_RATE = 0.0006
@@ -48,7 +48,6 @@ position = None
 cooldown_until = None
 last_processed_candle_time = None
 last_entry_candle_time = None
-pending_signal = None  # holds {'dir': 'BUY'/'SELL', 'created_at': datetime}
 
 KOLKATA = timezone(timedelta(hours=5, minutes=30))
 
@@ -79,7 +78,7 @@ exchange = ccxt.binance({
 if USE_TESTNET:
     exchange.set_sandbox_mode(True)
 
-# =================== STRATEGY: EMA + Volume Confirmation ===================
+# =================== STRATEGY: EMA + Volume Confirmation (backtest-like immediate entry) ===================
 EMA_SHORT = 10
 EMA_LONG = 50
 VOL_WINDOW = 20
@@ -90,34 +89,44 @@ def compute_ema(df, period):
 
 def detect_crossover(df):
     """
-    EMA + Volume Confirmation Strategy:
-    - BUY: Short EMA crosses above Long EMA and Volume > 20-bar average.
-    - SELL: Short EMA crosses below Long EMA and Volume > 20-bar average.
+    EMA + Volume Confirmation Strategy (backtest behavior):
+    - BUY: Short EMA crosses above Long EMA and current volume > 20-bar average.
+    - SELL: Short EMA crosses below Long EMA and current volume > 20-bar average.
+    This function only *detects* a signal on the last closed candle. It DOES NOT handle pending orders;
+    immediate entry logic is applied in the main loop (entry at the closed candle's close).
     """
     if len(df) < MIN_HISTORY:
         return None
 
-    df['ema_short'] = compute_ema(df, EMA_SHORT)
-    df['ema_long'] = compute_ema(df, EMA_LONG)
-    df['vol_ma'] = df['volume'].rolling(VOL_WINDOW).mean()
+    # compute indicators on a copy to avoid modifying original unexpectedly
+    tmp = df.copy()
+    tmp['ema_short'] = compute_ema(tmp, EMA_SHORT)
+    tmp['ema_long'] = compute_ema(tmp, EMA_LONG)
+    tmp['vol_ma'] = tmp['volume'].rolling(VOL_WINDOW).mean()
 
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
+    prev = tmp.iloc[-2]
+    curr = tmp.iloc[-1]
 
     # Volume confirmation
     high_vol = curr['volume'] > curr['vol_ma']
 
-    # Check crossover + volume
     if high_vol:
+        # BUY crossover
         if prev['ema_short'] <= prev['ema_long'] and curr['ema_short'] > curr['ema_long']:
             return 'BUY'
-        elif prev['ema_short'] >= prev['ema_long'] and curr['ema_short'] < curr['ema_long']:
+        # SELL crossover
+        if prev['ema_short'] >= prev['ema_long'] and curr['ema_short'] < curr['ema_long']:
             return 'SELL'
 
     return None
 
 # =================== SIMULATION FUNCTIONS ===================
 def simulate_trade(dir_side, entry, tp, sl, candle):
+    """
+    Intrabar simulation across the candle from low->high evenly spaced.
+    Note: since we enter at the close of the confirmed candle, we only simulate exits
+    on subsequent candles (this function is used on candles AFTER entry).
+    """
     low, high = candle['low'], candle['high']
     if high < low: high, low = low, high
     intrabar_prices = np.linspace(low, high, INTRABAR_STEPS)
@@ -131,11 +140,12 @@ def simulate_trade(dir_side, entry, tp, sl, candle):
             if p >= sl: outcome, exit_price = 'SL', sl; break
     return outcome, exit_price
 
-# =================== MAIN LOOP ===================
+# =================== MAIN LOOP (modified for immediate-entry on closed candle) ===================
 async def main_loop():
     global in_position, position, balance, cooldown_until
-    global last_processed_candle_time, last_entry_candle_time, pending_signal
+    global last_processed_candle_time, last_entry_candle_time
 
+    # seed history (get enough candles)
     seed_limit = max(200, MIN_HISTORY + 10)
     ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=seed_limit)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
@@ -165,81 +175,86 @@ async def main_loop():
                     'time': candle_start
                 }
 
+                # --- Closed candle arrives: we WILL analyze and possibly ENTER IMMEDIATELY at its close ---
                 if k['x']:
+                    # append the closed candle to history
                     df = pd.concat([df, pd.DataFrame([current_candle])], ignore_index=True)
                     if len(df) > 1000:
                         df = df.iloc[-1000:].reset_index(drop=True)
 
-                    if cooldown_until and now_ist() < cooldown_until:
-                        pending_signal = None
-                    else:
-                        signal = detect_crossover(df)
-                        if signal and not in_position:
-                            pending_signal = {'dir': signal, 'created_at': now_ist()}
-                            print(f"[{now_str()}] Signal detected -> {signal}. Pending entry on next candle open.", flush=True)
-
+                    # --- FIRST: if there's an existing position that was entered BEFORE this candle,
+                    #           we simulate exits using THIS closed candle (so exits can occur on candles after entry) ---
                     if in_position and SIMULATION_MODE == 'on':
-                        outcome, exit_price = simulate_trade(position['dir'], position['entry'], position['tp'], position['sl'], current_candle)
-                        if outcome:
-                            pnl = (exit_price-position['entry'])*LOT_SIZE if position['dir']=='BUY' else (position['entry']-exit_price)*LOT_SIZE
-                            fee = position['entry'] * LOT_SIZE * FEE_RATE * 2
-                            pnl -= fee
-                            balance += pnl
-                            rec = {
-                                'time': position['entry_time'].isoformat(),
-                                'dir': position['dir'],
-                                'entry': position['entry'],
-                                'exit': exit_price,
-                                'outcome': outcome,
-                                'pnl': round(pnl,6),
-                                'balance': round(balance,6)
-                            }
-                            append_trade_csv(rec)
-                            print(f"[SIM] [{outcome}] {position['dir']} closed. PnL={round(pnl,6)} | Balance={round(balance,6)}", flush=True)
-                            in_position=False
-                            position=None
-                            if outcome=='SL':
-                                cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
-                                print(f"[{now_str()}] SL hit -> cooldown until {cooldown_until}", flush=True)
+                        # only simulate if the position entry_time is strictly before this candle's time
+                        # (prevents immediate self-hit when entry is at this candle's close)
+                        if position and position.get('entry_time') and position['entry_time'] < current_candle['time']:
+                            outcome, exit_price = simulate_trade(position['dir'], position['entry'], position['tp'], position['sl'], current_candle)
+                            if outcome:
+                                pnl = (exit_price - position['entry']) * LOT_SIZE if position['dir']=='BUY' else (position['entry'] - exit_price) * LOT_SIZE
+                                fee = position['entry'] * LOT_SIZE * FEE_RATE * 2
+                                pnl -= fee
+                                balance += pnl
+                                rec = {
+                                    'time': position['entry_time'].isoformat(),
+                                    'dir': position['dir'],
+                                    'entry': position['entry'],
+                                    'exit': exit_price,
+                                    'outcome': outcome,
+                                    'pnl': round(pnl,6),
+                                    'balance': round(balance,6)
+                                }
+                                append_trade_csv(rec)
+                                print(f"[SIM] [{outcome}] {position['dir']} closed. PnL={round(pnl,6)} | Balance={round(balance,6)}", flush=True)
+                                in_position=False
+                                position=None
+                                if outcome=='SL':
+                                    cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
+                                    print(f"[{now_str()}] SL hit -> cooldown until {cooldown_until}", flush=True)
 
+                    # --- SECOND: if there's NO active position and NOT in cooldown, detect signal on this closed candle ---
+                    if (not in_position) and (not cooldown_until or now_ist() >= cooldown_until):
+                        signal = detect_crossover(df)
+                        if signal:
+                            # Immediate entry at the closed candle's close (backtest style)
+                            entry_price = current_candle['close']
+                            dir_side = signal
+                            if dir_side == 'BUY':
+                                tp_price = entry_price + TP_POINTS
+                                sl_price = entry_price - SL_POINTS
+                            else:
+                                tp_price = entry_price - TP_POINTS
+                                sl_price = entry_price + SL_POINTS
+
+                            position = {
+                                'dir': dir_side,
+                                'entry': entry_price,
+                                'tp': tp_price,
+                                'sl': sl_price,
+                                'entry_time': current_candle['time']
+                            }
+                            in_position = True
+                            last_entry_candle_time = current_candle['time']
+                            print(f"[{now_str()}] ENTRY (instant on close) -> {dir_side} | Entry={entry_price} TP={tp_price} SL={sl_price}", flush=True)
+
+                            # Live mode: place market order (if enabled)
+                            if LIVE_MODE=='on' and SIMULATION_MODE=='off':
+                                try:
+                                    qty = LOT_SIZE
+                                    order = exchange.create_order(SYMBOL, 'market', dir_side.lower(), qty)
+                                    print(f"[LIVE] Order placed: {order.get('id','(no id)')}", flush=True)
+                                except Exception as e:
+                                    print(f"[LIVE] Order failed: {e}", flush=True)
+
+                    # update last_processed_candle_time
                     last_processed_candle_time = current_candle['time']
 
                 else:
-                    if pending_signal and not in_position:
-                        if last_entry_candle_time is None or candle_start != last_entry_candle_time:
-                            if cooldown_until and now_ist() < cooldown_until:
-                                pending_signal = None
-                                print(f"[{now_str()}] Pending signal cleared due to active cooldown.", flush=True)
-                            else:
-                                entry_price = float(k['o'])
-                                dir_side = pending_signal['dir']
-                                if dir_side == 'BUY':
-                                    tp_price = entry_price + TP_POINTS
-                                    sl_price = entry_price - SL_POINTS
-                                else:
-                                    tp_price = entry_price - TP_POINTS
-                                    sl_price = entry_price + SL_POINTS
+                    # forming candle: do nothing for entries (we use closed-candle immediate-entry behavior)
+                    # but keep history small if desired
+                    # Optionally, you might still keep df updated with the forming candle if you want realtime indicator plotting.
+                    pass
 
-                                position = {
-                                    'dir': dir_side,
-                                    'entry': entry_price,
-                                    'tp': tp_price,
-                                    'sl': sl_price,
-                                    'entry_time': now_ist()
-                                }
-                                in_position = True
-                                last_entry_candle_time = candle_start
-                                pending_signal = None
-                                print(f"[{now_str()}] ENTRY executed -> {dir_side} | Entry={entry_price} TP={tp_price} SL={sl_price}", flush=True)
-
-                                if LIVE_MODE=='on' and SIMULATION_MODE=='off':
-                                    try:
-                                        qty = LOT_SIZE
-                                        order = exchange.create_order(SYMBOL, 'market', dir_side.lower(), qty)
-                                        print(f"[LIVE] Order placed: {order.get('id','(no id)')}", flush=True)
-                                    except Exception as e:
-                                        print(f"[LIVE] Order failed: {e}", flush=True)
-
+                # keep df size reasonable
                 if len(df) > 1000:
                     df = df.iloc[-1000:].reset_index(drop=True)
 
