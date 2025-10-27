@@ -12,11 +12,11 @@ import sys
 import traceback
 
 # =================== CONFIG ===================
-SYMBOL = 'BNB/USDT'
+SYMBOL = 'ETH/USDT'
 TIMEFRAME = '1m'
-LOT_SIZE = 0.10
-TP_POINTS = 6.0
-SL_POINTS = 3.0
+LOT_SIZE = 0.01
+TP_POINTS = 30
+SL_POINTS = 15
 LEVERAGE = 75
 
 LIVE_MODE = 'off'          # 'on' = live trading
@@ -79,50 +79,41 @@ exchange = ccxt.binance({
 if USE_TESTNET:
     exchange.set_sandbox_mode(True)
 
-# =================== STRATEGY: EMA Crossover Confirmation (single set) ===================
-EMA_SET = [10, 20, 50, 100]
-SHORT_EMAS = EMA_SET[:len(EMA_SET)//2]  # [10,20]
-LONG_EMAS = EMA_SET[len(EMA_SET)//2:]   # [50,100]
-MIN_HISTORY = max(EMA_SET) + 2
+# =================== STRATEGY: EMA + Volume Confirmation ===================
+EMA_SHORT = 10
+EMA_LONG = 50
+VOL_WINDOW = 20
+MIN_HISTORY = max(EMA_LONG, VOL_WINDOW) + 5
 
-def compute_ema_series(df, periods):
-    """Return a dict period -> pandas Series (same index as df)."""
-    out = {}
-    for p in periods:
-        out[p] = df['close'].ewm(span=p, adjust=False).mean()
-    return out
+def compute_ema(df, period):
+    return df['close'].ewm(span=period, adjust=False).mean()
 
 def detect_crossover(df):
     """
-    Detect crossover on the last closed candle in df.
-    Returns 'BUY' or 'SELL' if crossover happened on last candle relative to previous candle,
-    else None.
+    EMA + Volume Confirmation Strategy:
+    - BUY: Short EMA crosses above Long EMA and Volume > 20-bar average.
+    - SELL: Short EMA crosses below Long EMA and Volume > 20-bar average.
     """
     if len(df) < MIN_HISTORY:
         return None
 
-    ema_series = compute_ema_series(df, EMA_SET)
-    # build short and long average series
-    short_cols = pd.DataFrame({f'ema{s}': ema_series[s] for s in SHORT_EMAS})
-    long_cols = pd.DataFrame({f'ema{l}': ema_series[l] for l in LONG_EMAS})
+    df['ema_short'] = compute_ema(df, EMA_SHORT)
+    df['ema_long'] = compute_ema(df, EMA_LONG)
+    df['vol_ma'] = df['volume'].rolling(VOL_WINDOW).mean()
 
-    short_avg = short_cols.mean(axis=1)
-    long_avg = long_cols.mean(axis=1)
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
 
-    # previous and current (last index)
-    prev_idx = len(df) - 2
-    curr_idx = len(df) - 1
+    # Volume confirmation
+    high_vol = curr['volume'] > curr['vol_ma']
 
-    short_prev = short_avg.iloc[prev_idx]
-    long_prev = long_avg.iloc[prev_idx]
-    short_curr = short_avg.iloc[curr_idx]
-    long_curr = long_avg.iloc[curr_idx]
+    # Check crossover + volume
+    if high_vol:
+        if prev['ema_short'] <= prev['ema_long'] and curr['ema_short'] > curr['ema_long']:
+            return 'BUY'
+        elif prev['ema_short'] >= prev['ema_long'] and curr['ema_short'] < curr['ema_long']:
+            return 'SELL'
 
-    # Crossover detection (require a change)
-    if short_prev <= long_prev and short_curr > long_curr:
-        return 'BUY'
-    if short_prev >= long_prev and short_curr < long_curr:
-        return 'SELL'
     return None
 
 # =================== SIMULATION FUNCTIONS ===================
@@ -145,7 +136,6 @@ async def main_loop():
     global in_position, position, balance, cooldown_until
     global last_processed_candle_time, last_entry_candle_time, pending_signal
 
-    # Seed history (get at least 200 candles to be safe)
     seed_limit = max(200, MIN_HISTORY + 10)
     ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=seed_limit)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
@@ -153,7 +143,6 @@ async def main_loop():
 
     print(f"[{now_str()}] Bot started | LIVE: {LIVE_MODE} | SIM: {SIMULATION_MODE}", flush=True)
 
-    # initialize last_processed times
     if len(df) >= 2:
         last_processed_candle_time = df.iloc[-1]['time']
     else:
@@ -172,36 +161,27 @@ async def main_loop():
                     'high': float(k['h']),
                     'low': float(k['l']),
                     'close': float(k['c']),
+                    'volume': float(k['v']),
                     'time': candle_start
                 }
 
-                # If candle closed -> this is a closed candle we can analyze for crossover
                 if k['x']:
-                    # Append closed candle to df (this is the candle we detect crossover on)
                     df = pd.concat([df, pd.DataFrame([current_candle])], ignore_index=True)
-                    # keep history reasonable
                     if len(df) > 1000:
                         df = df.iloc[-1000:].reset_index(drop=True)
 
-                    # Skip if cooldown or already in position
                     if cooldown_until and now_ist() < cooldown_until:
-                        # shift and continue; clear pending if any
                         pending_signal = None
                     else:
-                        # detect crossover on this newly-closed candle
                         signal = detect_crossover(df)
                         if signal and not in_position:
-                            # set pending signal which will be executed on next candle open
                             pending_signal = {'dir': signal, 'created_at': now_ist()}
-                            print(f"[{now_str()}] Crossover detected -> {signal}. Pending entry on next candle open.", flush=True)
+                            print(f"[{now_str()}] Signal detected -> {signal}. Pending entry on next candle open.", flush=True)
 
-                    # If we have an open position (entered earlier), simulate using this closed candle
                     if in_position and SIMULATION_MODE == 'on':
-                        # simulate using this closed candle (this is the candle after entry or subsequent candles)
                         outcome, exit_price = simulate_trade(position['dir'], position['entry'], position['tp'], position['sl'], current_candle)
                         if outcome:
                             pnl = (exit_price-position['entry'])*LOT_SIZE if position['dir']=='BUY' else (position['entry']-exit_price)*LOT_SIZE
-                            # subtract fees (entry+exit)
                             fee = position['entry'] * LOT_SIZE * FEE_RATE * 2
                             pnl -= fee
                             balance += pnl
@@ -222,21 +202,15 @@ async def main_loop():
                                 cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
                                 print(f"[{now_str()}] SL hit -> cooldown until {cooldown_until}", flush=True)
 
-                    # update last_processed time
                     last_processed_candle_time = current_candle['time']
 
                 else:
-                    # This is an updating (forming) candle. We will use the candle's open to execute pending entry (next candle open).
-                    # Execute entry at the first update of that candle (avoid re-executing)
                     if pending_signal and not in_position:
-                        # ensure we don't execute multiple times for same candle
                         if last_entry_candle_time is None or candle_start != last_entry_candle_time:
-                            # Check cooldown again before entry
                             if cooldown_until and now_ist() < cooldown_until:
                                 pending_signal = None
                                 print(f"[{now_str()}] Pending signal cleared due to active cooldown.", flush=True)
                             else:
-                                # Execute entry at this candle's open price
                                 entry_price = float(k['o'])
                                 dir_side = pending_signal['dir']
                                 if dir_side == 'BUY':
@@ -256,9 +230,8 @@ async def main_loop():
                                 in_position = True
                                 last_entry_candle_time = candle_start
                                 pending_signal = None
-                                print(f"[{now_str()}] ENTRY executed on next open -> {dir_side} | Entry={entry_price} TP={tp_price} SL={sl_price}", flush=True)
+                                print(f"[{now_str()}] ENTRY executed -> {dir_side} | Entry={entry_price} TP={tp_price} SL={sl_price}", flush=True)
 
-                                # Live mode: place market order
                                 if LIVE_MODE=='on' and SIMULATION_MODE=='off':
                                     try:
                                         qty = LOT_SIZE
@@ -267,9 +240,6 @@ async def main_loop():
                                     except Exception as e:
                                         print(f"[LIVE] Order failed: {e}", flush=True)
 
-                    # No simulation on forming candle. We'll wait until it closes to simulate entries/exits.
-
-                # keep df size reasonable (we added closed candle above when k['x'])
                 if len(df) > 1000:
                     df = df.iloc[-1000:].reset_index(drop=True)
 
