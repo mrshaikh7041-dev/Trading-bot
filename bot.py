@@ -12,21 +12,31 @@ import sys
 import traceback
 
 # =================== CONFIG ===================
-SYMBOL = 'ETH/USDT'
+SYMBOL = 'XRP/USDT'
 TIMEFRAME = '1m'
-LOT_SIZE = 0.02
-TP_POINTS = 30
-SL_POINTS = 15
-LEVERAGE = 75
+LOT_SIZE = 25
 
+# Fixed USDT values (aapki requirement)
+TARGET_PROFIT_USDT = 0.6
+STOP_LOSS_USDT = 0.3
+
+# Auto-calculate points
+TP_POINTS = TARGET_PROFIT_USDT / LOT_SIZE  # 0.024
+SL_POINTS = STOP_LOSS_USDT / LOT_SIZE      # 0.012
+
+LEVERAGE = 75
 LIVE_MODE = 'off'          # 'on' = live trading
 SIMULATION_MODE = 'on'     # 'on' = paper trading
-PAPER_BALANCE = 2.0        # simulation balance
+PAPER_BALANCE = 2.0       # simulation balance
 COOLDOWN_MINUTES = 30
 INTRABAR_STEPS = 50
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
 LOG_FILE = 'bot.log'
-FEE_RATE = 0.0006
+FEE_PER_TRADE = 0.005      # 0.005 USDT one time per closed trade
+
+# Strategy Parameters
+BB_PERIOD = 20
+BB_STD = 1.5
 
 # ======= LIVE API KEYS (only needed if LIVE_MODE=='on') =======
 API_KEY = ''       # put your key here
@@ -49,6 +59,14 @@ cooldown_until = None
 last_processed_candle_time = None
 last_entry_candle_time = None
 
+# Performance tracking
+performance = {
+    'total_trades': 0,
+    'win_trades': 0,
+    'total_pnl': 0.0,
+    'last_hourly_check': None
+}
+
 KOLKATA = timezone(timedelta(hours=5, minutes=30))
 
 def now_ist():
@@ -59,7 +77,7 @@ def now_str():
 
 # =================== CSV Logging ===================
 def append_trade_csv(record):
-    header = ['time','dir','entry','exit','outcome','pnl','balance']
+    header = ['time','dir','entry','exit','outcome','pnl','balance','fees']
     file_exists = os.path.isfile(CSV_FN)
     with open(CSV_FN,'a',newline='',encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=header)
@@ -78,85 +96,90 @@ exchange = ccxt.binance({
 if USE_TESTNET:
     exchange.set_sandbox_mode(True)
 
-# =================== STRATEGY: EMA + Volume Confirmation (backtest-like immediate entry) ===================
-EMA_SHORT = 10
-EMA_LONG = 50
-VOL_WINDOW = 20
-MIN_HISTORY = max(EMA_LONG, VOL_WINDOW) + 5
-
-def compute_ema(df, period):
-    return df['close'].ewm(span=period, adjust=False).mean()
-
-def detect_crossover(df):
+# =================== STRATEGY: BOLLINGER BANDS ===================
+def detect_bb_signal(df):
     """
-    EMA + Volume Confirmation Strategy (backtest behavior):
-    - BUY: Short EMA crosses above Long EMA and current volume > 20-bar average.
-    - SELL: Short EMA crosses below Long EMA and current volume > 20-bar average.
-    This function only *detects* a signal on the last closed candle. It DOES NOT handle pending orders;
-    immediate entry logic is applied in the main loop (entry at the closed candle's close).
+    Bollinger Bands Strategy (Backtest mein profitable thi)
+    BUY: Price touches lower band
+    SELL: Price touches upper band
     """
-    if len(df) < MIN_HISTORY:
+    if len(df) < BB_PERIOD:
         return None
-
-    # compute indicators on a copy to avoid modifying original unexpectedly
+    
     tmp = df.copy()
-    tmp['ema_short'] = compute_ema(tmp, EMA_SHORT)
-    tmp['ema_long'] = compute_ema(tmp, EMA_LONG)
-    tmp['vol_ma'] = tmp['volume'].rolling(VOL_WINDOW).mean()
-
-    prev = tmp.iloc[-2]
+    tmp['bb_middle'] = tmp['close'].rolling(BB_PERIOD).mean()
+    tmp['bb_std'] = tmp['close'].rolling(BB_PERIOD).std()
+    tmp['bb_upper'] = tmp['bb_middle'] + (tmp['bb_std'] * BB_STD)
+    tmp['bb_lower'] = tmp['bb_middle'] - (tmp['bb_std'] * BB_STD)
+    
     curr = tmp.iloc[-1]
-
-    # Volume confirmation
-    high_vol = curr['volume'] > curr['vol_ma']
-
-    if high_vol:
-        # BUY crossover
-        if prev['ema_short'] <= prev['ema_long'] and curr['ema_short'] > curr['ema_long']:
-            return 'BUY'
-        # SELL crossover
-        if prev['ema_short'] >= prev['ema_long'] and curr['ema_short'] < curr['ema_long']:
-            return 'SELL'
-
+    
+    # BUY when price touches lower band
+    if curr['low'] <= curr['bb_lower']:
+        return 'BUY'
+    # SELL when price touches upper band
+    elif curr['high'] >= curr['bb_upper']:
+        return 'SELL'
+    
     return None
 
 # =================== SIMULATION FUNCTIONS ===================
 def simulate_trade(dir_side, entry, tp, sl, candle):
     """
     Intrabar simulation across the candle from low->high evenly spaced.
-    Note: since we enter at the close of the confirmed candle, we only simulate exits
-    on subsequent candles (this function is used on candles AFTER entry).
     """
     low, high = candle['low'], candle['high']
-    if high < low: high, low = low, high
+    if high < low: 
+        high, low = low, high
     intrabar_prices = np.linspace(low, high, INTRABAR_STEPS)
     outcome, exit_price = None, None
+    
     for p in intrabar_prices:
-        if dir_side=='BUY':
-            if p >= tp: outcome, exit_price = 'TP', tp; break
-            if p <= sl: outcome, exit_price = 'SL', sl; break
-        else:
-            if p <= tp: outcome, exit_price = 'TP', tp; break
-            if p >= sl: outcome, exit_price = 'SL', sl; break
+        if dir_side == 'BUY':
+            if p >= tp: 
+                outcome, exit_price = 'TP', tp
+                break
+            if p <= sl: 
+                outcome, exit_price = 'SL', sl
+                break
+        else:  # SELL
+            if p <= tp: 
+                outcome, exit_price = 'TP', tp
+                break
+            if p >= sl: 
+                outcome, exit_price = 'SL', sl
+                break
     return outcome, exit_price
 
-# =================== MAIN LOOP (modified for immediate-entry on closed candle) ===================
+def print_performance_summary():
+    """Print performance summary"""
+    if performance['total_trades'] > 0:
+        win_rate = (performance['win_trades'] / performance['total_trades']) * 100
+        avg_pnl = performance['total_pnl'] / performance['total_trades']
+        print(f"[PERFORMANCE] Trades: {performance['total_trades']} | Win Rate: {win_rate:.1f}% | Total PnL: ${performance['total_pnl']:.4f} | Avg PnL: ${avg_pnl:.4f}")
+
+# =================== MAIN LOOP ===================
 async def main_loop():
     global in_position, position, balance, cooldown_until
     global last_processed_candle_time, last_entry_candle_time
+    global performance
 
     # seed history (get enough candles)
-    seed_limit = max(200, MIN_HISTORY + 10)
+    seed_limit = max(200, BB_PERIOD + 10)
     ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=seed_limit)
     df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
     df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True).dt.tz_convert('Asia/Kolkata')
 
     print(f"[{now_str()}] Bot started | LIVE: {LIVE_MODE} | SIM: {SIMULATION_MODE}", flush=True)
+    print(f"[CONFIG] Symbol: {SYMBOL} | Lot Size: {LOT_SIZE} | TP: ${TARGET_PROFIT_USDT} | SL: ${STOP_LOSS_USDT}", flush=True)
+    print(f"[CONFIG] TP Points: {TP_POINTS:.6f} | SL Points: {SL_POINTS:.6f}", flush=True)
 
     if len(df) >= 2:
         last_processed_candle_time = df.iloc[-1]['time']
     else:
         last_processed_candle_time = None
+
+    performance['last_hourly_check'] = now_ist()
 
     stream = f"wss://stream.binance.com:9443/ws/{SYMBOL.replace('/','').lower()}@kline_1m"
 
@@ -175,49 +198,71 @@ async def main_loop():
                     'time': candle_start
                 }
 
-                # --- Closed candle arrives: we WILL analyze and possibly ENTER IMMEDIATELY at its close ---
+                # --- Closed candle processing ---
                 if k['x']:
-                    # append the closed candle to history
+                    # Append the closed candle to history
                     df = pd.concat([df, pd.DataFrame([current_candle])], ignore_index=True)
                     if len(df) > 1000:
                         df = df.iloc[-1000:].reset_index(drop=True)
 
-                    # --- FIRST: if there's an existing position that was entered BEFORE this candle,
-                    #           we simulate exits using THIS closed candle (so exits can occur on candles after entry) ---
+                    # --- Check for position exit ---
                     if in_position and SIMULATION_MODE == 'on':
-                        # only simulate if the position entry_time is strictly before this candle's time
-                        # (prevents immediate self-hit when entry is at this candle's close)
                         if position and position.get('entry_time') and position['entry_time'] < current_candle['time']:
-                            outcome, exit_price = simulate_trade(position['dir'], position['entry'], position['tp'], position['sl'], current_candle)
+                            outcome, exit_price = simulate_trade(
+                                position['dir'], 
+                                position['entry'], 
+                                position['tp'], 
+                                position['sl'], 
+                                current_candle
+                            )
+                            
                             if outcome:
-                                pnl = (exit_price - position['entry']) * LOT_SIZE if position['dir']=='BUY' else (position['entry'] - exit_price) * LOT_SIZE
-                                fee = position['entry'] * LOT_SIZE * FEE_RATE * 2
-                                pnl -= fee
+                                # Calculate PnL
+                                if position['dir'] == 'BUY':
+                                    pnl = (exit_price - position['entry']) * LOT_SIZE
+                                else:
+                                    pnl = (position['entry'] - exit_price) * LOT_SIZE
+                                
+                                # Apply fixed fee (0.005 USDT per trade)
+                                pnl -= FEE_PER_TRADE
                                 balance += pnl
+                                
+                                # Update performance tracking
+                                performance['total_trades'] += 1
+                                performance['total_pnl'] += pnl
+                                if outcome == 'TP':
+                                    performance['win_trades'] += 1
+                                
+                                # Create trade record
                                 rec = {
                                     'time': position['entry_time'].isoformat(),
                                     'dir': position['dir'],
-                                    'entry': position['entry'],
-                                    'exit': exit_price,
+                                    'entry': round(position['entry'], 6),
+                                    'exit': round(exit_price, 6),
                                     'outcome': outcome,
-                                    'pnl': round(pnl,6),
-                                    'balance': round(balance,6)
+                                    'pnl': round(pnl, 6),
+                                    'balance': round(balance, 6),
+                                    'fees': FEE_PER_TRADE
                                 }
+                                
                                 append_trade_csv(rec)
-                                print(f"[SIM] [{outcome}] {position['dir']} closed. PnL={round(pnl,6)} | Balance={round(balance,6)}", flush=True)
-                                in_position=False
-                                position=None
-                                if outcome=='SL':
+                                print(f"[SIM] [{outcome}] {position['dir']} closed. PnL=${round(pnl,6)} | Balance=${round(balance,6)} | Fee=${FEE_PER_TRADE}", flush=True)
+                                
+                                in_position = False
+                                position = None
+                                
+                                if outcome == 'SL':
                                     cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
                                     print(f"[{now_str()}] SL hit -> cooldown until {cooldown_until}", flush=True)
 
-                    # --- SECOND: if there's NO active position and NOT in cooldown, detect signal on this closed candle ---
+                    # --- Check for new entry signal ---
                     if (not in_position) and (not cooldown_until or now_ist() >= cooldown_until):
-                        signal = detect_crossover(df)
+                        signal = detect_bb_signal(df)
                         if signal:
-                            # Immediate entry at the closed candle's close (backtest style)
+                            # Immediate entry at the closed candle's close
                             entry_price = current_candle['close']
                             dir_side = signal
+                            
                             if dir_side == 'BUY':
                                 tp_price = entry_price + TP_POINTS
                                 sl_price = entry_price - SL_POINTS
@@ -234,10 +279,11 @@ async def main_loop():
                             }
                             in_position = True
                             last_entry_candle_time = current_candle['time']
-                            print(f"[{now_str()}] ENTRY (instant on close) -> {dir_side} | Entry={entry_price} TP={tp_price} SL={sl_price}", flush=True)
+                            
+                            print(f"[{now_str()}] ENTRY -> {dir_side} | Entry=${entry_price:.6f} TP=${tp_price:.6f} SL=${sl_price:.6f}", flush=True)
 
                             # Live mode: place market order (if enabled)
-                            if LIVE_MODE=='on' and SIMULATION_MODE=='off':
+                            if LIVE_MODE == 'on' and SIMULATION_MODE == 'off':
                                 try:
                                     qty = LOT_SIZE
                                     order = exchange.create_order(SYMBOL, 'market', dir_side.lower(), qty)
@@ -245,16 +291,17 @@ async def main_loop():
                                 except Exception as e:
                                     print(f"[LIVE] Order failed: {e}", flush=True)
 
-                    # update last_processed_candle_time
+                    # Update last processed candle time
                     last_processed_candle_time = current_candle['time']
+                    
+                    # Hourly performance summary
+                    current_time = now_ist()
+                    if (performance['last_hourly_check'] is None or 
+                        current_time - performance['last_hourly_check'] >= timedelta(hours=1)):
+                        print_performance_summary()
+                        performance['last_hourly_check'] = current_time
 
-                else:
-                    # forming candle: do nothing for entries (we use closed-candle immediate-entry behavior)
-                    # but keep history small if desired
-                    # Optionally, you might still keep df updated with the forming candle if you want realtime indicator plotting.
-                    pass
-
-                # keep df size reasonable
+                # Keep df size reasonable
                 if len(df) > 1000:
                     df = df.iloc[-1000:].reset_index(drop=True)
 
@@ -263,11 +310,13 @@ async def main_loop():
                 traceback.print_exc()
 
 # =================== RUN BOT ===================
-try:
-    asyncio.run(main_loop())
-except KeyboardInterrupt:
-    print("\n[INFO] KeyboardInterrupt received. Exiting gracefully...", flush=True)
-    sys.exit(0)
-except Exception as e:
-    print(f"[ERROR] {e}", flush=True)
-    traceback.print_exc()
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("\n[INFO] KeyboardInterrupt received. Exiting gracefully...", flush=True)
+        print_performance_summary()
+        sys.exit(0)
+    except Exception as e:
+        print(f"[ERROR] {e}", flush=True)
+        traceback.print_exc()
