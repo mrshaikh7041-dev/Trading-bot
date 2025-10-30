@@ -28,7 +28,7 @@ LEVERAGE = 75
 LIVE_MODE = 'off'          # 'on' = live trading
 SIMULATION_MODE = 'on'     # 'on' = paper trading
 PAPER_BALANCE = 2.0       # simulation balance
-COOLDOWN_MINUTES = 30
+COOLDOWN_MINUTES = 0
 INTRABAR_STEPS = 50
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
 LOG_FILE = 'bot.log'
