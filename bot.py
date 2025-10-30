@@ -59,6 +59,10 @@ cooldown_until = None
 last_processed_candle_time = None
 last_entry_candle_time = None
 
+# NEW: Pending signal for next candle entry
+pending_signal = None
+pending_signal_time = None
+
 # Performance tracking
 performance = {
     'total_trades': 0,
@@ -162,6 +166,7 @@ def print_performance_summary():
 async def main_loop():
     global in_position, position, balance, cooldown_until
     global last_processed_candle_time, last_entry_candle_time
+    global pending_signal, pending_signal_time
     global performance
 
     # seed history (get enough candles)
@@ -205,7 +210,36 @@ async def main_loop():
                     if len(df) > 1000:
                         df = df.iloc[-1000:].reset_index(drop=True)
 
-                    # --- Check for position exit ---
+                    # --- 1. FIRST: Check for pending signal from previous candle ---
+                    if pending_signal and not in_position and (not cooldown_until or now_ist() >= cooldown_until):
+                        # Next candle entry at OPEN price (Backtest jaisa)
+                        entry_price = current_candle['open']
+                        dir_side = pending_signal
+                        
+                        if dir_side == 'BUY':
+                            tp_price = entry_price + TP_POINTS
+                            sl_price = entry_price - SL_POINTS
+                        else:
+                            tp_price = entry_price - TP_POINTS
+                            sl_price = entry_price + SL_POINTS
+
+                        position = {
+                            'dir': dir_side,
+                            'entry': entry_price,
+                            'tp': tp_price,
+                            'sl': sl_price,
+                            'entry_time': current_candle['time']
+                        }
+                        in_position = True
+                        last_entry_candle_time = current_candle['time']
+                        
+                        print(f"[{now_str()}] ENTRY (Next Candle) -> {dir_side} | Entry=${entry_price:.6f} TP=${tp_price:.6f} SL=${sl_price:.6f}", flush=True)
+                        
+                        # Clear pending signal
+                        pending_signal = None
+                        pending_signal_time = None
+
+                    # --- 2. SECOND: Check for position exit ---
                     if in_position and SIMULATION_MODE == 'on':
                         if position and position.get('entry_time') and position['entry_time'] < current_candle['time']:
                             outcome, exit_price = simulate_trade(
@@ -217,11 +251,17 @@ async def main_loop():
                             )
                             
                             if outcome:
-                                # Calculate PnL
-                                if position['dir'] == 'BUY':
-                                    pnl = (exit_price - position['entry']) * LOT_SIZE
+                                # Calculate PnL - FIXED USDT VALUES (Backtest jaisa)
+                                if outcome == "TP":
+                                    pnl = TARGET_PROFIT_USDT  # Fixed 0.6 USDT profit
+                                elif outcome == "SL":
+                                    pnl = -STOP_LOSS_USDT     # Fixed 0.3 USDT loss  
                                 else:
-                                    pnl = (position['entry'] - exit_price) * LOT_SIZE
+                                    # NO_EXIT case only
+                                    if position['dir'] == 'BUY':
+                                        pnl = (exit_price - position['entry']) * LOT_SIZE
+                                    else:
+                                        pnl = (position['entry'] - exit_price) * LOT_SIZE
                                 
                                 # Apply fixed fee (0.005 USDT per trade)
                                 pnl -= FEE_PER_TRADE
@@ -255,41 +295,14 @@ async def main_loop():
                                     cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
                                     print(f"[{now_str()}] SL hit -> cooldown until {cooldown_until}", flush=True)
 
-                    # --- Check for new entry signal ---
-                    if (not in_position) and (not cooldown_until or now_ist() >= cooldown_until):
+                    # --- 3. THIRD: Detect new signal for NEXT candle ---
+                    if (not in_position) and (not pending_signal) and (not cooldown_until or now_ist() >= cooldown_until):
                         signal = detect_bb_signal(df)
                         if signal:
-                            # Immediate entry at the closed candle's close
-                            entry_price = current_candle['close']
-                            dir_side = signal
-                            
-                            if dir_side == 'BUY':
-                                tp_price = entry_price + TP_POINTS
-                                sl_price = entry_price - SL_POINTS
-                            else:
-                                tp_price = entry_price - TP_POINTS
-                                sl_price = entry_price + SL_POINTS
-
-                            position = {
-                                'dir': dir_side,
-                                'entry': entry_price,
-                                'tp': tp_price,
-                                'sl': sl_price,
-                                'entry_time': current_candle['time']
-                            }
-                            in_position = True
-                            last_entry_candle_time = current_candle['time']
-                            
-                            print(f"[{now_str()}] ENTRY -> {dir_side} | Entry=${entry_price:.6f} TP=${tp_price:.6f} SL=${sl_price:.6f}", flush=True)
-
-                            # Live mode: place market order (if enabled)
-                            if LIVE_MODE == 'on' and SIMULATION_MODE == 'off':
-                                try:
-                                    qty = LOT_SIZE
-                                    order = exchange.create_order(SYMBOL, 'market', dir_side.lower(), qty)
-                                    print(f"[LIVE] Order placed: {order.get('id','(no id)')}", flush=True)
-                                except Exception as e:
-                                    print(f"[LIVE] Order failed: {e}", flush=True)
+                            # Store signal for next candle entry
+                            pending_signal = signal
+                            pending_signal_time = current_candle['time']
+                            print(f"[{now_str()}] SIGNAL DETECTED -> {signal} | Will enter at next candle open", flush=True)
 
                     # Update last processed candle time
                     last_processed_candle_time = current_candle['time']
