@@ -27,7 +27,7 @@ LEVERAGE = 75
 LIVE_MODE = 'off'          # 'on' = live trading
 SIMULATION_MODE = 'on'     # 'on' = paper trading
 PAPER_BALANCE = 2.0       # simulation balance
-COOLDOWN_MINUTES = 30
+COOLDOWN_MINUTES = 0
 INTRABAR_STEPS = 50
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
 LOG_FILE = 'bot.log'
@@ -70,7 +70,8 @@ performance = {
     'last_hourly_check': None,
     'total_signals': 0,  # DEBUG: Total signals detected
     'missed_signals': 0, # DEBUG: Signals missed due to cooldown/margin
-    'executed_signals': 0 # DEBUG: Signals that became trades
+    'executed_signals': 0, # DEBUG: Signals that became trades
+    'historical_signals_count': 0 # DEBUG: Backtest jaisa historical count
 }
 
 KOLKATA = timezone(timedelta(hours=5, minutes=30))
@@ -105,7 +106,7 @@ if USE_TESTNET:
 # =================== STRATEGY: BOLLINGER BANDS ===================
 def detect_bb_signal(df):
     """
-    Bollinger Bands Strategy (Backtest mein profitable thi)
+    Bollinger Bands Strategy - BACKTEST JAISA (POORA DATAFRAME process)
     BUY: Price touches lower band
     SELL: Price touches upper band
     """
@@ -118,24 +119,41 @@ def detect_bb_signal(df):
     tmp['bb_upper'] = tmp['bb_middle'] + (tmp['bb_std'] * BB_STD)
     tmp['bb_lower'] = tmp['bb_middle'] - (tmp['bb_std'] * BB_STD)
     
+    # BACKTEST JAISA: Poore dataframe mein signals count karo
+    total_historical_signals = 0
+    recent_signals = []
+    
+    for i in range(BB_PERIOD, len(tmp)):
+        if tmp.loc[i, "low"] <= tmp.loc[i, "bb_lower"]:
+            total_historical_signals += 1
+            if i >= len(tmp) - 20:  # Last 20 candles ke signals track karo
+                recent_signals.append(f"BUY@{tmp.loc[i]['time'].strftime('%H:%M')}")
+        elif tmp.loc[i, "high"] >= tmp.loc[i, "bb_upper"]:
+            total_historical_signals += 1
+            if i >= len(tmp) - 20:  # Last 20 candles ke signals track karo
+                recent_signals.append(f"SELL@{tmp.loc[i]['time'].strftime('%H:%M')}")
+    
+    # DEBUG: Complete historical analysis
+    performance['historical_signals_count'] = total_historical_signals
+    
+    print(f"[DEBUG] 🔍 HISTORICAL ANALYSIS:")
+    print(f"[DEBUG] 📊 Total Signals in {len(df)} candles: {total_historical_signals}")
+    print(f"[DEBUG] ⏰ Recent Signals: {recent_signals[-10:] if recent_signals else 'None'}")
+    
+    # Real trading ke liye sirf latest candle ka signal return karo
     curr = tmp.iloc[-1]
-    
-    # DEBUG: Print BB values for analysis
-    bb_upper = curr.get('bb_upper', 0)
-    bb_lower = curr.get('bb_lower', 0)
-    price = curr['close']
-    
-    print(f"[DEBUG] Price: {price:.6f} | BB Upper: {bb_upper:.6f} | BB Lower: {bb_lower:.6f} | Diff Upper: {(price - bb_upper):.6f} | Diff Lower: {(bb_lower - price):.6f}")
+    curr_time = df.iloc[-1]['time'].strftime('%H:%M')
     
     # BUY when price touches lower band
     if curr['low'] <= curr['bb_lower']:
-        print(f"[DEBUG] ✅ BUY SIGNAL - Low: {curr['low']:.6f} <= BB Lower: {curr['bb_lower']:.6f}")
+        print(f"[DEBUG] ✅ CURRENT BUY SIGNAL @ {curr_time} | Historical: {total_historical_signals} signals")
         return 'BUY'
     # SELL when price touches upper band
     elif curr['high'] >= curr['bb_upper']:
-        print(f"[DEBUG] ✅ SELL SIGNAL - High: {curr['high']:.6f} >= BB Upper: {curr['bb_upper']:.6f}")
+        print(f"[DEBUG] ✅ CURRENT SELL SIGNAL @ {curr_time} | Historical: {total_historical_signals} signals")
         return 'SELL'
     
+    print(f"[DEBUG] ❌ NO CURRENT SIGNAL @ {curr_time} | Historical: {total_historical_signals} signals")
     return None
 
 # =================== SIMULATION FUNCTIONS ===================
@@ -176,11 +194,17 @@ def print_performance_summary():
         total_signals = performance['total_signals']
         executed_signals = performance['executed_signals']
         missed_signals = performance['missed_signals']
+        historical_signals = performance['historical_signals_count']
         
         execution_rate = (executed_signals / total_signals * 100) if total_signals > 0 else 0
+        historical_vs_current = (total_signals / historical_signals * 100) if historical_signals > 0 else 0
         
         print(f"[PERFORMANCE] Trades: {performance['total_trades']} | Win Rate: {win_rate:.1f}% | Total PnL: ${performance['total_pnl']:.4f} | Avg PnL: ${avg_pnl:.4f}")
-        print(f"[DEBUG] Signals: {total_signals} | Executed: {executed_signals} | Missed: {missed_signals} | Execution Rate: {execution_rate:.1f}%")
+        print(f"[DEBUG] 📈 SIGNAL ANALYSIS:")
+        print(f"[DEBUG]    Historical Signals: {historical_signals} (Backtest jaisa)")
+        print(f"[DEBUG]    Current Signals: {total_signals} (Real-time)")
+        print(f"[DEBUG]    Execution Rate: {execution_rate:.1f}%")
+        print(f"[DEBUG]    Historical vs Current: {historical_vs_current:.1f}%")
 
 def get_latest_data():
     """CCXT se latest 1 day data fetch karo (WebSocket replacement)"""
@@ -231,7 +255,7 @@ async def main_loop():
                 total_candles = len(df)
                 expected_candles = 1440  # 1 day
                 data_completeness = (total_candles/expected_candles*100) if expected_candles > 0 else 0
-                print(f"[DEBUG] Data Quality: {total_candles}/{expected_candles} candles ({data_completeness:.1f}%)")
+                print(f"[DEBUG] 📦 DATA QUALITY: {total_candles}/{expected_candles} candles ({data_completeness:.1f}%)")
                 
                 # --- 1. FIRST: Check for pending signal from previous minute ---
                 if pending_signal and not in_position and (not cooldown_until or current_time >= cooldown_until):
@@ -346,7 +370,7 @@ async def main_loop():
                         performance['total_signals'] += 1
                         
                         print(f"[{now_str()}] SIGNAL DETECTED -> {signal} | Will enter at next data fetch", flush=True)
-                        print(f"[DEBUG] 📊 TOTAL SIGNALS: {performance['total_signals']}")
+                        print(f"[DEBUG] 📊 TOTAL REAL-TIME SIGNALS: {performance['total_signals']}")
                     
                     elif cooldown_until and current_time < cooldown_until:
                         # DEBUG: Signal missed due to cooldown
