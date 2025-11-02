@@ -2,7 +2,8 @@ import ccxt
 import pandas as pd
 import numpy as np
 import asyncio
-import time
+import websockets
+import json
 from datetime import datetime, timedelta, timezone
 import os
 import csv
@@ -15,32 +16,32 @@ SYMBOL = 'XRP/USDT'
 TIMEFRAME = '1m'
 LOT_SIZE = 25
 
-# Fixed USDT values (aapki requirement)
+# Fixed USDT values
 TARGET_PROFIT_USDT = 0.6
 STOP_LOSS_USDT = 0.3
 
-# Auto-calculate points
-TP_POINTS = TARGET_PROFIT_USDT / LOT_SIZE  # 0.024
-SL_POINTS = STOP_LOSS_USDT / LOT_SIZE      # 0.012
+TP_POINTS = TARGET_PROFIT_USDT / LOT_SIZE
+SL_POINTS = STOP_LOSS_USDT / LOT_SIZE
 
 LEVERAGE = 75
-LIVE_MODE = 'off'          # 'on' = live trading
-SIMULATION_MODE = 'on'     # 'on' = paper trading
-PAPER_BALANCE = 2.0       # simulation balance
-COOLDOWN_MINUTES = 0
+LIVE_MODE = 'off'          
+SIMULATION_MODE = 'on'     
+PAPER_BALANCE = 2.0       
+COOLDOWN_MINUTES = 30
 INTRABAR_STEPS = 50
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
 LOG_FILE = 'bot.log'
-FEE_PER_TRADE = 0.005      # 0.005 USDT one time per closed trade
+FEE_PER_TRADE = 0.005      
 
-# Strategy Parameters
-BB_PERIOD = 20
-BB_STD = 1.5
+# Strategy parameters
+RSI_PERIOD = 14
+RSI_LOW = 40
+RSI_HIGH = 60
 
-# ======= LIVE API KEYS (only needed if LIVE_MODE=='on') =======
-API_KEY = ''       # put your key here
-API_SECRET = ''    # put your secret here
-USE_TESTNET = True  # True = Binance testnet for live trades
+# ======= LIVE API KEYS =======
+API_KEY = ''      
+API_SECRET = ''   
+USE_TESTNET = True  
 
 # =================== LOGGING ===================
 logging.basicConfig(
@@ -57,22 +58,10 @@ position = None
 cooldown_until = None
 last_processed_candle_time = None
 last_entry_candle_time = None
-
-# NEW: Pending signal for next candle entry
 pending_signal = None
 pending_signal_time = None
 
-# Performance tracking
-performance = {
-    'total_trades': 0,
-    'win_trades': 0,
-    'total_pnl': 0.0,
-    'last_hourly_check': None,
-    'total_signals': 0,  # DEBUG: Total signals detected
-    'missed_signals': 0, # DEBUG: Signals missed due to cooldown/margin
-    'executed_signals': 0, # DEBUG: Signals that became trades
-    'historical_signals_count': 0 # DEBUG: Backtest jaisa historical count
-}
+performance = {'total_trades': 0, 'win_trades': 0, 'total_pnl': 0.0, 'last_hourly_check': None}
 
 KOLKATA = timezone(timedelta(hours=5, minutes=30))
 
@@ -99,68 +88,34 @@ exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
 })
-
 if USE_TESTNET:
     exchange.set_sandbox_mode(True)
 
-# =================== STRATEGY: BOLLINGER BANDS ===================
-def detect_bb_signal(df):
+# =================== STRATEGY: RSI (40–60) ===================
+def detect_rsi_signal(df):
     """
-    Bollinger Bands Strategy - BACKTEST JAISA (POORA DATAFRAME process)
-    BUY: Price touches lower band
-    SELL: Price touches upper band
+    RSI strategy:
+    BUY when RSI < 40
+    SELL when RSI > 60
     """
-    if len(df) < BB_PERIOD:
+    if len(df) < RSI_PERIOD:
         return None
-    
-    tmp = df.copy()
-    tmp['bb_middle'] = tmp['close'].rolling(BB_PERIOD).mean()
-    tmp['bb_std'] = tmp['close'].rolling(BB_PERIOD).std()
-    tmp['bb_upper'] = tmp['bb_middle'] + (tmp['bb_std'] * BB_STD)
-    tmp['bb_lower'] = tmp['bb_middle'] - (tmp['bb_std'] * BB_STD)
-    
-    # BACKTEST JAISA: Poore dataframe mein signals count karo
-    total_historical_signals = 0
-    recent_signals = []
-    
-    for i in range(BB_PERIOD, len(tmp)):
-        if tmp.loc[i, "low"] <= tmp.loc[i, "bb_lower"]:
-            total_historical_signals += 1
-            if i >= len(tmp) - 20:  # Last 20 candles ke signals track karo
-                recent_signals.append(f"BUY@{tmp.loc[i]['time'].strftime('%H:%M')}")
-        elif tmp.loc[i, "high"] >= tmp.loc[i, "bb_upper"]:
-            total_historical_signals += 1
-            if i >= len(tmp) - 20:  # Last 20 candles ke signals track karo
-                recent_signals.append(f"SELL@{tmp.loc[i]['time'].strftime('%H:%M')}")
-    
-    # DEBUG: Complete historical analysis
-    performance['historical_signals_count'] = total_historical_signals
-    
-    print(f"[DEBUG] 🔍 HISTORICAL ANALYSIS:")
-    print(f"[DEBUG] 📊 Total Signals in {len(df)} candles: {total_historical_signals}")
-    print(f"[DEBUG] ⏰ Recent Signals: {recent_signals[-10:] if recent_signals else 'None'}")
-    
-    # Real trading ke liye sirf latest candle ka signal return karo
-    curr = tmp.iloc[-1]
-    curr_time = df.iloc[-1]['time'].strftime('%H:%M')
-    
-    # BUY when price touches lower band
-    if curr['low'] <= curr['bb_lower']:
-        print(f"[DEBUG] ✅ CURRENT BUY SIGNAL @ {curr_time} | Historical: {total_historical_signals} signals")
+
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(RSI_PERIOD).mean()
+    loss = -delta.where(delta < 0, 0).rolling(RSI_PERIOD).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    curr = df.iloc[-1]
+    if curr['rsi'] < RSI_LOW:
         return 'BUY'
-    # SELL when price touches upper band
-    elif curr['high'] >= curr['bb_upper']:
-        print(f"[DEBUG] ✅ CURRENT SELL SIGNAL @ {curr_time} | Historical: {total_historical_signals} signals")
+    elif curr['rsi'] > RSI_HIGH:
         return 'SELL'
-    
-    print(f"[DEBUG] ❌ NO CURRENT SIGNAL @ {curr_time} | Historical: {total_historical_signals} signals")
     return None
 
 # =================== SIMULATION FUNCTIONS ===================
 def simulate_trade(dir_side, entry, tp, sl, candle):
-    """
-    Intrabar simulation across the candle from low->high evenly spaced.
-    """
     low, high = candle['low'], candle['high']
     if high < low: 
         high, low = low, high
@@ -185,214 +140,113 @@ def simulate_trade(dir_side, entry, tp, sl, candle):
     return outcome, exit_price
 
 def print_performance_summary():
-    """Print performance summary with DEBUG info"""
     if performance['total_trades'] > 0:
         win_rate = (performance['win_trades'] / performance['total_trades']) * 100
         avg_pnl = performance['total_pnl'] / performance['total_trades']
-        
-        # DEBUG: Signal statistics
-        total_signals = performance['total_signals']
-        executed_signals = performance['executed_signals']
-        missed_signals = performance['missed_signals']
-        historical_signals = performance['historical_signals_count']
-        
-        execution_rate = (executed_signals / total_signals * 100) if total_signals > 0 else 0
-        historical_vs_current = (total_signals / historical_signals * 100) if historical_signals > 0 else 0
-        
         print(f"[PERFORMANCE] Trades: {performance['total_trades']} | Win Rate: {win_rate:.1f}% | Total PnL: ${performance['total_pnl']:.4f} | Avg PnL: ${avg_pnl:.4f}")
-        print(f"[DEBUG] 📈 SIGNAL ANALYSIS:")
-        print(f"[DEBUG]    Historical Signals: {historical_signals} (Backtest jaisa)")
-        print(f"[DEBUG]    Current Signals: {total_signals} (Real-time)")
-        print(f"[DEBUG]    Execution Rate: {execution_rate:.1f}%")
-        print(f"[DEBUG]    Historical vs Current: {historical_vs_current:.1f}%")
 
-def get_latest_data():
-    """CCXT se latest 1 day data fetch karo (WebSocket replacement)"""
-    try:
-        # Last 24 hours data
-        since = exchange.milliseconds() - 24 * 60 * 60 * 1000
-        ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, since=since, limit=1500)
-        
-        df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-        df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True).dt.tz_convert('Asia/Kolkata')
-        
-        print(f"[DATA] Fetched {len(df)} candles | Latest: {df.iloc[-1]['time']}")
-        return df
-        
-    except Exception as e:
-        print(f"[DATA ERROR] {e}")
-        return pd.DataFrame()
-
-# =================== MAIN LOOP (CCXT BASED) ===================
+# =================== MAIN LOOP ===================
 async def main_loop():
     global in_position, position, balance, cooldown_until
     global last_processed_candle_time, last_entry_candle_time
     global pending_signal, pending_signal_time
     global performance
 
+    seed_limit = max(200, RSI_PERIOD + 10)
+    ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=seed_limit)
+    df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
+    df['time'] = pd.to_datetime(df['time'], unit='ms', utc=True).dt.tz_convert('Asia/Kolkata')
+
     print(f"[{now_str()}] Bot started | LIVE: {LIVE_MODE} | SIM: {SIMULATION_MODE}", flush=True)
     print(f"[CONFIG] Symbol: {SYMBOL} | Lot Size: {LOT_SIZE} | TP: ${TARGET_PROFIT_USDT} | SL: ${STOP_LOSS_USDT}", flush=True)
-    print(f"[CONFIG] TP Points: {TP_POINTS:.6f} | SL Points: {SL_POINTS:.6f}", flush=True)
+    print(f"[CONFIG] RSI Period: {RSI_PERIOD} | Levels: {RSI_LOW}-{RSI_HIGH}", flush=True)
+
+    if len(df) >= 2:
+        last_processed_candle_time = df.iloc[-1]['time']
 
     performance['last_hourly_check'] = now_ist()
-    last_data_fetch = now_ist()
+    stream = f"wss://stream.binance.com:9443/ws/{SYMBOL.replace('/','').lower()}@kline_1m"
 
-    while True:
-        try:
-            current_time = now_ist()
-            
-            # Har 60 seconds mein naya data fetch karo
-            if (current_time - last_data_fetch).total_seconds() >= 60:
-                df = get_latest_data()
-                if df.empty:
-                    print(f"[{now_str()}] No data received, retrying...")
-                    await asyncio.sleep(10)
-                    continue
-                
-                last_data_fetch = current_time
-                
-                # DEBUG: Data quality check
-                total_candles = len(df)
-                expected_candles = 1440  # 1 day
-                data_completeness = (total_candles/expected_candles*100) if expected_candles > 0 else 0
-                print(f"[DEBUG] 📦 DATA QUALITY: {total_candles}/{expected_candles} candles ({data_completeness:.1f}%)")
-                
-                # --- 1. FIRST: Check for pending signal from previous minute ---
-                if pending_signal and not in_position and (not cooldown_until or current_time >= cooldown_until):
-                    # Next candle entry at latest open price
-                    entry_price = df.iloc[-1]['open']
-                    dir_side = pending_signal
-                    
-                    # Margin check
-                    required_margin = (entry_price * LOT_SIZE) / LEVERAGE
-                    if balance >= required_margin:
-                        
-                        if dir_side == 'BUY':
-                            tp_price = entry_price + TP_POINTS
-                            sl_price = entry_price - SL_POINTS
-                        else:
-                            tp_price = entry_price - TP_POINTS
-                            sl_price = entry_price + SL_POINTS
+    async with websockets.connect(stream) as ws:
+        async for msg in ws:
+            try:
+                data = json.loads(msg)
+                k = data['k']
+                candle_start = pd.to_datetime(k['t'], unit='ms', utc=True).tz_convert('Asia/Kolkata')
+                current_candle = {
+                    'open': float(k['o']),
+                    'high': float(k['h']),
+                    'low': float(k['l']),
+                    'close': float(k['c']),
+                    'volume': float(k['v']),
+                    'time': candle_start
+                }
 
-                        position = {
-                            'dir': dir_side,
-                            'entry': entry_price,
-                            'tp': tp_price,
-                            'sl': sl_price,
-                            'entry_time': df.iloc[-1]['time']
-                        }
+                # --- Closed candle processing ---
+                if k['x']:
+                    df = pd.concat([df, pd.DataFrame([current_candle])], ignore_index=True)
+                    if len(df) > 1000:
+                        df = df.iloc[-1000:].reset_index(drop=True)
+
+                    # 1️⃣ Check pending signal for entry
+                    if pending_signal and not in_position and (not cooldown_until or now_ist() >= cooldown_until):
+                        entry_price = current_candle['open']
+                        dir_side = pending_signal
+                        tp_price = entry_price + TP_POINTS if dir_side == 'BUY' else entry_price - TP_POINTS
+                        sl_price = entry_price - SL_POINTS if dir_side == 'BUY' else entry_price + SL_POINTS
+
+                        position = {'dir': dir_side, 'entry': entry_price, 'tp': tp_price, 'sl': sl_price, 'entry_time': current_candle['time']}
                         in_position = True
-                        last_entry_candle_time = df.iloc[-1]['time']
-                        
-                        # DEBUG: Signal executed
-                        performance['executed_signals'] += 1
-                        
-                        print(f"[{now_str()}] ENTRY (Next Candle) -> {dir_side} | Entry=${entry_price:.6f} TP=${tp_price:.6f} SL=${sl_price:.6f}", flush=True)
-                        print(f"[DEBUG] ✅ SIGNAL EXECUTED | Pending signal converted to trade")
-                        
-                        # Clear pending signal
+                        last_entry_candle_time = current_candle['time']
+
+                        print(f"[{now_str()}] ENTRY -> {dir_side} | Entry=${entry_price:.6f} TP=${tp_price:.6f} SL=${sl_price:.6f}", flush=True)
                         pending_signal = None
                         pending_signal_time = None
-                    else:
-                        # DEBUG: Margin insufficient
-                        print(f"[DEBUG] ❌ MARGIN INSUFFICIENT | Balance: ${balance:.4f} | Required: ${required_margin:.4f}")
-                        pending_signal = None
-                        performance['missed_signals'] += 1
 
-                # --- 2. SECOND: Check for position exit ---
-                if in_position and SIMULATION_MODE == 'on':
-                    if position and position.get('entry_time'):
-                        # Use latest candle for exit simulation
-                        latest_candle = df.iloc[-1]
-                        outcome, exit_price = simulate_trade(
-                            position['dir'], 
-                            position['entry'], 
-                            position['tp'], 
-                            position['sl'], 
-                            latest_candle
-                        )
-                        
-                        if outcome:
-                            # Calculate PnL - FIXED USDT VALUES (Backtest jaisa)
-                            if outcome == "TP":
-                                pnl = TARGET_PROFIT_USDT  # Fixed 0.6 USDT profit
-                            elif outcome == "SL":
-                                pnl = -STOP_LOSS_USDT     # Fixed 0.3 USDT loss  
-                            else:
-                                # NO_EXIT case only
-                                if position['dir'] == 'BUY':
-                                    pnl = (exit_price - position['entry']) * LOT_SIZE
-                                else:
-                                    pnl = (position['entry'] - exit_price) * LOT_SIZE
-                            
-                            # Apply fixed fee (0.005 USDT per trade)
-                            pnl -= FEE_PER_TRADE
-                            balance += pnl
-                            
-                            # Update performance tracking
-                            performance['total_trades'] += 1
-                            performance['total_pnl'] += pnl
-                            if outcome == 'TP':
-                                performance['win_trades'] += 1
-                            
-                            # Create trade record
-                            rec = {
-                                'time': position['entry_time'].isoformat(),
-                                'dir': position['dir'],
-                                'entry': round(position['entry'], 6),
-                                'exit': round(exit_price, 6),
-                                'outcome': outcome,
-                                'pnl': round(pnl, 6),
-                                'balance': round(balance, 6),
-                                'fees': FEE_PER_TRADE
-                            }
-                            
-                            append_trade_csv(rec)
-                            print(f"[SIM] [{outcome}] {position['dir']} closed. PnL=${round(pnl,6)} | Balance=${round(balance,6)} | Fee=${FEE_PER_TRADE}", flush=True)
-                            
-                            in_position = False
-                            position = None
-                            
-                            if outcome == 'SL':
-                                cooldown_until = current_time + timedelta(minutes=COOLDOWN_MINUTES)
-                                print(f"[{now_str()}] SL hit -> cooldown until {cooldown_until}", flush=True)
-                                print(f"[DEBUG] 🔄 COOLDOWN ACTIVATED for {COOLDOWN_MINUTES} minutes")
+                    # 2️⃣ Check exit
+                    if in_position and SIMULATION_MODE == 'on':
+                        if position and position['entry_time'] < current_candle['time']:
+                            outcome, exit_price = simulate_trade(position['dir'], position['entry'], position['tp'], position['sl'], current_candle)
+                            if outcome:
+                                pnl = TARGET_PROFIT_USDT if outcome == "TP" else -STOP_LOSS_USDT
+                                pnl -= FEE_PER_TRADE
+                                balance += pnl
 
-                # --- 3. THIRD: Detect new signal for NEXT candle ---
-                if (not in_position) and (not pending_signal) and (not cooldown_until or current_time >= cooldown_until):
-                    signal = detect_bb_signal(df)
-                    if signal:
-                        # Store signal for next candle entry
-                        pending_signal = signal
-                        pending_signal_time = current_time
-                        
-                        # DEBUG: Track total signals
-                        performance['total_signals'] += 1
-                        
-                        print(f"[{now_str()}] SIGNAL DETECTED -> {signal} | Will enter at next data fetch", flush=True)
-                        print(f"[DEBUG] 📊 TOTAL REAL-TIME SIGNALS: {performance['total_signals']}")
-                    
-                    elif cooldown_until and current_time < cooldown_until:
-                        # DEBUG: Signal missed due to cooldown
-                        performance['missed_signals'] += 1
-                        print(f"[DEBUG] ⏰ SIGNAL MISSED - In cooldown until {cooldown_until}")
+                                performance['total_trades'] += 1
+                                performance['total_pnl'] += pnl
+                                if outcome == 'TP': performance['win_trades'] += 1
 
-                # Update last processed time
-                last_processed_candle_time = df.iloc[-1]['time'] if not df.empty else None
-                
-                # Hourly performance summary
-                if (performance['last_hourly_check'] is None or 
-                    current_time - performance['last_hourly_check'] >= timedelta(hours=1)):
-                    print_performance_summary()
-                    performance['last_hourly_check'] = current_time
+                                rec = {'time': position['entry_time'].isoformat(),'dir': position['dir'],'entry': round(position['entry'], 6),
+                                       'exit': round(exit_price, 6),'outcome': outcome,'pnl': round(pnl, 6),
+                                       'balance': round(balance, 6),'fees': FEE_PER_TRADE}
+                                append_trade_csv(rec)
+                                print(f"[SIM] [{outcome}] {position['dir']} closed. PnL=${round(pnl,6)} | Balance=${round(balance,6)}", flush=True)
 
-            # Wait for next iteration
-            await asyncio.sleep(1)
+                                in_position = False
+                                position = None
+                                if outcome == 'SL':
+                                    cooldown_until = now_ist() + timedelta(minutes=COOLDOWN_MINUTES)
+                                    print(f"[{now_str()}] SL hit -> cooldown until {cooldown_until}", flush=True)
 
-        except Exception as e:
-            print(f"[ERROR] Exception in main loop: {e}", flush=True)
-            traceback.print_exc()
-            await asyncio.sleep(10)
+                    # 3️⃣ Detect RSI signal for next candle
+                    if (not in_position) and (not pending_signal) and (not cooldown_until or now_ist() >= cooldown_until):
+                        signal = detect_rsi_signal(df)
+                        if signal:
+                            pending_signal = signal
+                            pending_signal_time = current_candle['time']
+                            print(f"[{now_str()}] SIGNAL -> {signal} | Next candle entry", flush=True)
+
+                    last_processed_candle_time = current_candle['time']
+
+                    current_time = now_ist()
+                    if (performance['last_hourly_check'] is None or 
+                        current_time - performance['last_hourly_check'] >= timedelta(hours=1)):
+                        print_performance_summary()
+                        performance['last_hourly_check'] = current_time
+
+            except Exception as e:
+                print(f"[ERROR] {e}", flush=True)
+                traceback.print_exc()
 
 # =================== RUN BOT ===================
 if __name__ == "__main__":
