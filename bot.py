@@ -35,8 +35,8 @@ FEE_PER_TRADE = 0.005
 
 # Strategy parameters
 RSI_PERIOD = 14
-RSI_LOW = 20
-RSI_HIGH = 60
+RSI_LOW = 10
+RSI_HIGH = 35
 
 # ======= LIVE API KEYS =======
 API_KEY = ''      
