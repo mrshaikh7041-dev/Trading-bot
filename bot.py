@@ -36,7 +36,7 @@ FEE_PER_TRADE = 0.005
 # Strategy parameters
 RSI_PERIOD = 14
 RSI_LOW = 10
-RSI_HIGH = 35
+RSI_HIGH = 37
 
 # ======= LIVE API KEYS =======
 API_KEY = ''      
@@ -91,28 +91,34 @@ exchange = ccxt.binance({
 if USE_TESTNET:
     exchange.set_sandbox_mode(True)
 
-# =================== STRATEGY: RSI (40–60) ===================
+# =================== STRATEGY: RSI (Code 1 style – EMA RSI) ===================
 def detect_rsi_signal(df):
     """
-    RSI strategy:
-    BUY when RSI < 40
-    SELL when RSI > 60
+    RSI strategy (same as Code 1 backtest):
+    BUY when RSI < RSI_LOW
+    SELL when RSI > RSI_HIGH
+    Uses exponential moving averages (EWM) for RSI.
     """
-    if len(df) < RSI_PERIOD:
+    if len(df) < RSI_PERIOD + 1:
         return None
 
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(RSI_PERIOD).mean()
-    loss = -delta.where(delta < 0, 0).rolling(RSI_PERIOD).mean()
+    df = df.copy()
+    delta = df["close"].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(span=RSI_PERIOD).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(span=RSI_PERIOD).mean()
     rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    curr = df.iloc[-1]
-    if curr['rsi'] < RSI_LOW:
-        return 'BUY'
-    elif curr['rsi'] > RSI_HIGH:
-        return 'SELL'
-    return None
+    curr_rsi = df.iloc[-1]["rsi"]
+    if pd.isna(curr_rsi):
+        return None
+
+    if curr_rsi < RSI_LOW:
+        return "BUY"
+    elif curr_rsi > RSI_HIGH:
+        return "SELL"
+    else:
+        return None
 
 # =================== SIMULATION FUNCTIONS ===================
 def simulate_trade(dir_side, entry, tp, sl, candle):
