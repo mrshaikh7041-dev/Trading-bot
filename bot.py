@@ -12,8 +12,21 @@ import time
 from datetime import datetime, timedelta, timezone
 import sys
 import traceback
+import logging
 
-# ================== USER CONFIG — DO EXACTLY AS ASKED ==================
+# 🔹 Log setup (added lines)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("/home/ubuntu/Trading-bot/bot.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+print = lambda *args, **kwargs: logging.info(" ".join(map(str, args)))
+# 🔹 End log setup
+
+# ================== USER CONFIG ==================
 SIMULATION = True
 LIVE = False
 
@@ -47,18 +60,11 @@ exchange = ccxt.binance({
 
 # Timezone helper (IST)
 IST = timezone(timedelta(hours=5, minutes=30))
-
-
 def now_ist():
     return datetime.now(timezone.utc).astimezone(IST)
 
-
-# ----------------- HISTORICAL FETCH (used for seeding) -----------------
+# ----------------- HISTORICAL FETCH -----------------
 def fetch_history(symbol, timeframe, days=1):
-    """
-    Fetches historical OHLCV using exchange.fetch_ohlcv.
-    Returns a pandas DataFrame with tz-aware IST times.
-    """
     since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
     all_bars = []
     fetch_since = since
@@ -81,7 +87,6 @@ def fetch_history(symbol, timeframe, days=1):
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(IST)
     return df.drop_duplicates(subset="time").reset_index(drop=True)
 
-
 # ----------------- RSI (Wilder / EWMA) -----------------
 def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
@@ -91,14 +96,8 @@ def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-
-# ----------------- INTRABAR NEUTRAL OUTCOME -----------------
+# ----------------- INTRABAR OUTCOME -----------------
 def intrabar_outcome(side, o, h, l, tp_lvl, sl_lvl):
-    """
-    Simulate a neutral intrabar path (up then down) and check if TP/SL hit.
-    Returns (outcome, price) where outcome is 'TP' or 'SL' or (None, None).
-    """
-    # create path: half steps from open->high, half steps open->low
     half = max(2, INTRABAR_STEPS // 2)
     up = np.linspace(o, h, half, endpoint=False)
     down = np.linspace(o, l, half, endpoint=True)
@@ -109,13 +108,12 @@ def intrabar_outcome(side, o, h, l, tp_lvl, sl_lvl):
                 return 'TP', tp_lvl
             if p <= sl_lvl:
                 return 'SL', sl_lvl
-        else:  # SELL (short)
+        else:
             if p <= tp_lvl:
                 return 'TP', tp_lvl
             if p >= sl_lvl:
                 return 'SL', sl_lvl
     return None, None
-
 
 # ----------------- HYBRID ENGINE -----------------
 class Position:
@@ -125,7 +123,6 @@ class Position:
         self.tp_raw = tp_raw
         self.sl_raw = sl_raw
         self.entry_time = entry_time
-
 
 class SymbolState:
     def __init__(self, symbol: str, cfg: dict):
@@ -148,7 +145,6 @@ class SymbolState:
             'volume': float(k.get('v', 0)), 'time': pd.to_datetime(k['t'], unit='ms', utc=True).tz_convert(IST)
         }
         self.df = pd.concat([self.df, pd.DataFrame([row])], ignore_index=True)
-        # keep size bounded
         if len(self.df) > 2000:
             self.df = self.df.iloc[-1200:].reset_index(drop=True)
 
@@ -166,12 +162,9 @@ class SymbolState:
             return 'SELL'
         return None
 
-
-# create states
 states = {s: SymbolState(s, cfg) for s, cfg in COINS.items()}
 
-
-# ----------------- SIMULATION (fills matching backtest logic) -----------------
+# ----------------- SIMULATION -----------------
 def sim_try_enter(state: SymbolState):
     if state.in_position:
         return
@@ -180,17 +173,13 @@ def sim_try_enter(state: SymbolState):
     sig = state.calc_signal()
     if not sig:
         return
-    # set pending to be executed at next candle open
     state.pending_signal = sig
     state.pending_time = state.df.iloc[-1]['time']
 
-
 def sim_handle_entry_and_exit(state: SymbolState):
-    # Entry: if pending signal and not in position -> enter at last closed candle's open (treated as next candle open)
     if state.pending_signal and not state.in_position:
         next_open = float(state.df.iloc[-1]['open'])
         side = state.pending_signal
-        lot = state.cfg['lot_size']
         entry = next_open
         if side == 'BUY':
             tp_raw = entry + state.cfg['tp']
@@ -204,7 +193,6 @@ def sim_handle_entry_and_exit(state: SymbolState):
         state.pending_time = None
         print(f"[{now_ist()}][SIM][ENTER] {state.symbol} {side} @ {entry:.8f}")
 
-    # Exit: check intrabar outcome on the same (last) closed candle
     if state.in_position and state.position:
         pos = state.position
         o = float(state.df.iloc[-1]['open'])
@@ -213,11 +201,7 @@ def sim_handle_entry_and_exit(state: SymbolState):
         outcome, exit_px = intrabar_outcome(pos.side, o, h, l, pos.tp_raw, pos.sl_raw)
         if outcome:
             lot = state.cfg['lot_size']
-            if pos.side == 'BUY':
-                pnl = (exit_px - pos.entry) * lot
-            else:
-                pnl = (pos.entry - exit_px) * lot
-            # apply flat fee per trade (simulation requirement)
+            pnl = (exit_px - pos.entry) * lot if pos.side == 'BUY' else (pos.entry - exit_px) * lot
             pnl -= SIM_FEE_PER_TRADE
             state.sim_balance += pnl
             print(f"[{now_ist()}][SIM][EXIT] {state.symbol} {outcome} @ {exit_px:.8f} pnl={pnl:.8f} bal={state.sim_balance:.6f}")
@@ -226,87 +210,18 @@ def sim_handle_entry_and_exit(state: SymbolState):
             if outcome == 'SL':
                 state.cooldown_until = state.df.iloc[-1]['time'] + timedelta(minutes=COOLDOWN_MINUTES)
 
-
-# ----------------- LIVE ENTRY/EXIT (create orders + reduceOnly TP/SL) -----------------
-def live_enter(symbol: str, state: SymbolState):
-    """
-    Place a market order and create reduceOnly TP/SL orders.
-    This is a skeleton that attempts to create orders with CCXT.
-    Use carefully; test on testnet / sandbox first.
-    """
-    try:
-        side = state.calc_signal()
-        if not side:
-            return
-        if state.in_position:
-            return
-
-        cfg = state.cfg
-        lot = cfg['lot_size']
-        next_open = float(state.df.iloc[-1]['open'])
-        # Notional guard (example - can be improved)
-        notional = next_open * lot
-        print(f"[{now_ist()}][LIVE][ORDER] Preparing market {side} {symbol} lot={lot} notional={notional:.4f}")
-
-        # Place market order
-        order = exchange.create_order(symbol, 'market', side.lower(), lot)
-        filled_px = float(order.get('average') or order.get('price') or next_open)
-        if side == 'BUY':
-            tp_raw = filled_px + cfg['tp']
-            sl_raw = filled_px - cfg['sl']
-            exit_side = 'sell'
-        else:
-            tp_raw = filled_px - cfg['tp']
-            sl_raw = filled_px + cfg['sl']
-            exit_side = 'buy'
-
-        params = {'reduceOnly': True}
-        # Create TP and SL orders (ccxt exchange specific; some exchanges may require different types/params)
-        try:
-            tp_order = exchange.create_order(symbol, 'take_profit_market', exit_side, lot, None,
-                                             {**params, 'stopPrice': exchange.price_to_precision(symbol, tp_raw)})
-        except Exception as e:
-            print(f"[{now_ist()}][LIVE][WARN] TP order failed: {e}")
-
-        try:
-            sl_order = exchange.create_order(symbol, 'stop_market', exit_side, lot, None,
-                                             {**params, 'stopPrice': exchange.price_to_precision(symbol, sl_raw)})
-        except Exception as e:
-            print(f"[{now_ist()}][LIVE][WARN] SL order failed: {e}")
-
-        state.in_position = True
-        state.position = Position(side, filled_px, tp_raw, sl_raw, now_ist())
-        print(f"[{now_ist()}][LIVE][ENTER] {symbol} {side} @ {filled_px:.8f} tp={tp_raw:.8f} sl={sl_raw:.8f}")
-
-    except Exception as e:
-        print(f"[{now_ist()}][LIVE][ERROR] enter {symbol}: {e}")
-        traceback.print_exc()
-
-
-# ----------------- MAIN LOOP (polling simplified variant) -----------------
+# ----------------- MAIN LOOP -----------------
 def seed_all(days=1):
     for s, st in states.items():
         st.seed(days=days)
         print(f"[{now_ist()}][SEED] {s}: {len(st.df)} candles")
 
-
 def tick_loop(poll_interval=60):
     seed_all(days=1)
-    if LIVE:
-        try:
-            bal = exchange.fetch_balance()
-            print(f"[{now_ist()}][LIVE MODE] Account balance snapshot fetched")
-            # caution: printing full balance may be verbose
-            # print(bal)
-        except Exception as e:
-            print(f"[{now_ist()}][LIVE MODE][ERROR] Failed to fetch live balance: {e}")
-            return
-
     print(f"[{now_ist()}] Starting main loop | SIMULATION={SIMULATION} LIVE={LIVE}")
     while True:
         try:
             for sym, st in states.items():
-                # fetch latest 2 candles to detect new closed candle
                 try:
                     raw = exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=2)
                 except Exception as e:
@@ -317,18 +232,9 @@ def tick_loop(poll_interval=60):
                 last = raw[-1]
                 k = {'t': int(last[0]), 'o': last[1], 'h': last[2], 'l': last[3], 'c': last[4], 'v': last[5]}
                 st.add_closed(k)
-
-                # Simulation flow
                 if SIMULATION:
                     sim_try_enter(st)
                     sim_handle_entry_and_exit(st)
-
-                # Live flow
-                if LIVE:
-                    # only enter when no position & not in cooldown & we have a signal
-                    if not st.in_position and (not st.cooldown_until or now_ist() >= st.cooldown_until):
-                        live_enter(sym, st)
-
             time.sleep(poll_interval)
         except KeyboardInterrupt:
             print("Interrupted by user. Exiting.")
@@ -336,13 +242,10 @@ def tick_loop(poll_interval=60):
         except Exception as e:
             print(f"[{now_ist()}][MAIN_LOOP][ERROR] {e}")
             traceback.print_exc()
-            # continue after short pause
             time.sleep(5)
-
 
 # ----------------- RUN -----------------
 if __name__ == '__main__':
-    # Safety: exactly one mode must be on
     if SIMULATION == LIVE:
         raise SystemExit("Set exactly one of SIMULATION or LIVE to True (not both).")
     print(f"Starting hybrid bot @ {now_ist()} | SIMULATION={SIMULATION} LIVE={LIVE}")
