@@ -41,8 +41,8 @@ COINS = {
 
 TIMEFRAME = "1m"
 RSI_PERIOD = 14
-RSI_LOW = 40
-RSI_HIGH = 60
+RSI_LOW = 10
+RSI_HIGH = 37
 
 INTRABAR_STEPS = 50
 SIM_FEE_PER_TRADE = 0.005  # flat per trade in simulation
