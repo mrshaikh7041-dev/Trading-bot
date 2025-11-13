@@ -41,13 +41,13 @@ COINS = {
 
 TIMEFRAME = "1m"
 RSI_PERIOD = 14
-RSI_LOW = 10
-RSI_HIGH = 37
+RSI_LOW = 20
+RSI_HIGH = 60
 
 INTRABAR_STEPS = 50
 SIM_FEE_PER_TRADE = 0.005  # flat per trade in simulation
 
-COOLDOWN_MINUTES = 30
+COOLDOWN_MINUTES = 20
 LEVERAGE = 75  # currently informational only
 
 # ----------------- CCXT exchange setup -----------------
