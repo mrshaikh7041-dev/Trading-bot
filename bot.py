@@ -39,7 +39,7 @@ API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
 
 COINS = {
     # lot_size interpreted as base-asset quantity when LIVE (e.g., BNB units).
-    "BNB/USDT": {"lot_size": 0.01, "tp": 6.0, "sl": 3.0, "starting_balance": 4.0},
+    "BNB/USDT": {"lot_size": 0.02, "tp": 6.0, "sl": 3.0, "starting_balance": 4.0},
 }
 
 TIMEFRAME = "1m"
@@ -64,7 +64,7 @@ exchange = ccxt.binance({
 })
 
 if USE_TESTNET:
-    exchange.set_sandbox_mode(False)
+    exchange.set_sandbox_mode(True)
 
 # ---------- time helper ----------
 IST = timezone(timedelta(hours=5, minutes=30))
