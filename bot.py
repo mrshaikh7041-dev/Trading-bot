@@ -15,7 +15,7 @@ from collections import deque
 SYMBOL = 'BNB/USDT'            # trading pair
 WS_SYMBOL = 'bnbusdt'          # for websocket stream (lowercase, no slash)
 TIMEFRAME = '1m'
-LOT_SIZE = 0.01
+LOT_SIZE = 0.02
 SL_POINTS = 3.0
 TP_POINTS = 6.0
 LEVERAGE = 75
