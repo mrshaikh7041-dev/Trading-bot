@@ -15,7 +15,7 @@ from collections import deque
 SYMBOL = 'BNB/USDT'            # trading pair
 WS_SYMBOL = 'bnbusdt'          # for websocket stream (lowercase, no slash)
 TIMEFRAME = '1m'
-LOT_SIZE = 0.02
+LOT_SIZE = 0.02                # your lot size
 SL_POINTS = 3.0
 TP_POINTS = 6.0
 LEVERAGE = 75
@@ -28,7 +28,12 @@ RSI_PERIOD = 14
 RSI_LOW = 20
 RSI_HIGH = 60
 
-# API KEYS - FILL LOCALLY (placeholders)
+# 🔹 LIMIT ENTRY CONFIG
+LIMIT_BUFFER = 0.02          # price offset for limit orders
+ENTRY_WAIT_SECONDS = 5       # wait after each limit attempt
+MAX_LIMIT_ATTEMPTS = 2       # after 2 attempts -> market fallback
+
+# API KEYS - FILL LOCALLY (REPLACE THESE, and delete old keys from Binance)
 API_KEY = 'czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ'
 API_SECRET = 'cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO'
 
@@ -104,10 +109,20 @@ def _round_amount(symbol, amount):
         market = exchange.markets.get(symbol)
         precision = market.get('precision', {}).get('amount')
         if precision is not None:
-            return float(round(amount, precision))
+            return float(round(amount, int(precision)))
     except Exception:
         pass
-    return amount
+    return float(amount)
+
+def _round_price(symbol, price):
+    try:
+        market = exchange.markets.get(symbol)
+        precision = market.get('precision', {}).get('price')
+        if precision is not None:
+            return float(round(price, int(precision)))
+    except Exception:
+        pass
+    return float(price)
 
 # =================== ORDER HELPERS ===================
 def set_leverage(symbol, leverage):
@@ -118,29 +133,46 @@ def set_leverage(symbol, leverage):
     except Exception as e:
         logging.warning(f"Set leverage failed: {e}")
 
-def create_market_entry(symbol, side, amount):
+def create_limit_entry(symbol, side_ccxt, amount, limit_price):
     amount_rounded = _round_amount(symbol, amount)
-    order = exchange.create_order(symbol, 'market', side.lower(), amount_rounded, None, {'reduceOnly': False})
+    limit_price_rounded = _round_price(symbol, limit_price)
+    order = exchange.create_order(symbol, 'limit', side_ccxt, amount_rounded, limit_price_rounded, {'reduceOnly': False})
     return order
 
-def place_tp_sl(symbol, side, amount, tp_price, sl_price):
-    close_side = 'sell' if side == 'BUY' else 'buy'
+def create_market_entry(symbol, side_ccxt, amount):
+    amount_rounded = _round_amount(symbol, amount)
+    order = exchange.create_order(symbol, 'market', side_ccxt, amount_rounded, None, {'reduceOnly': False})
+    return order
+
+def place_tp_sl(symbol, dir_signal, amount, tp_price, sl_price):
+    """
+    TP = limit reduceOnly
+    SL = STOP_MARKET reduceOnly
+    """
+    close_side = 'sell' if dir_signal == 'BUY' else 'buy'
     amount_rounded = _round_amount(symbol, amount)
     tp_order = None; sl_order = None
+
+    # TP LIMIT reduceOnly
     try:
+        tp_price_rounded = _round_price(symbol, tp_price)
         tp_order = exchange.create_order(
-            symbol, 'TAKE_PROFIT_MARKET', close_side, amount_rounded, None,
-            {'stopPrice': float(tp_price), 'reduceOnly': True}
+            symbol, 'limit', close_side, amount_rounded, tp_price_rounded,
+            {'reduceOnly': True}
         )
     except Exception as e:
         logging.warning(f"TP placement failed: {e}")
+
+    # SL STOP_MARKET reduceOnly
     try:
+        sl_price_rounded = _round_price(symbol, sl_price)
         sl_order = exchange.create_order(
             symbol, 'STOP_MARKET', close_side, amount_rounded, None,
-            {'stopPrice': float(sl_price), 'reduceOnly': True}
+            {'stopPrice': float(sl_price_rounded), 'reduceOnly': True}
         )
     except Exception as e:
         logging.warning(f"SL placement failed: {e}")
+
     return tp_order, sl_order
 
 # =================== 🔁 RSI STRATEGY (on closed candle) ===================
@@ -180,6 +212,139 @@ def check_rsi_signal_from_df(df):
     if r > RSI_HIGH:
         return 'SELL'
     return None
+
+# =================== SMART LIMIT ENTRY ENGINE ===================
+def smart_open_position(signal, approx_price):
+    """
+    Smart limit entry:
+      - Attempt 1: limit at approx_price +/- LIMIT_BUFFER
+      - Wait ENTRY_WAIT_SECONDS and check fill
+      - Attempt 2: limit at fresh price +/- LIMIT_BUFFER
+      - If still not filled: market fallback
+    On success: sets global in_position, position, places TP/SL.
+    """
+    global in_position, position
+
+    side_ccxt = 'buy' if signal == 'BUY' else 'sell'
+    qty = LOT_SIZE
+
+    try:
+        set_leverage(SYMBOL, LEVERAGE)
+    except Exception:
+        pass
+
+    # Helper to derive limit price based on direction
+    def get_limit_price(base_price):
+        if signal == 'BUY':
+            return base_price + LIMIT_BUFFER
+        else:
+            return base_price - LIMIT_BUFFER
+
+    entry_order = None
+    filled = False
+    entry_price_actual = None
+
+    # ---------- LIMIT ATTEMPTS ----------
+    current_price_ref = approx_price
+    for attempt in range(1, MAX_LIMIT_ATTEMPTS + 1):
+        try:
+            limit_price = _round_price(SYMBOL, get_limit_price(current_price_ref))
+            log.info(f"[ENTRY] Attempt {attempt} LIMIT {signal} qty={qty} @ {limit_price}")
+            print(f"[{now_str()}] ENTRY attempt {attempt}: LIMIT {signal} @ {limit_price}", flush=True)
+
+            order = create_limit_entry(SYMBOL, side_ccxt, qty, limit_price)
+            order_id = str(order.get('id')) if order and order.get('id') is not None else None
+
+            # Wait ENTRY_WAIT_SECONDS checking status
+            t0 = time.time()
+            while time.time() - t0 < ENTRY_WAIT_SECONDS:
+                time.sleep(1)
+                if not order_id:
+                    break
+                try:
+                    ord_info = exchange.fetch_order(order_id, SYMBOL)
+                    status = (ord_info.get('status') or '').lower()
+                    if status in ('closed', 'filled'):
+                        entry_order = ord_info
+                        filled = True
+                        break
+                except Exception:
+                    # ignore and continue polling
+                    pass
+
+            if filled:
+                break
+
+            # Not filled -> cancel and try again with fresh price
+            if order_id:
+                try:
+                    exchange.cancel_order(order_id, SYMBOL)
+                    log.info(f"[ENTRY] Canceled unfilled limit order {order_id}")
+                except Exception as e:
+                    log.warning(f"[ENTRY] Cancel failed for {order_id}: {e}")
+
+            # update reference price from ticker for next attempt
+            try:
+                ticker = exchange.fetch_ticker(SYMBOL)
+                last = ticker.get('last') or ticker.get('close')
+                if last:
+                    current_price_ref = float(last)
+            except Exception:
+                # fallback keep previous
+                pass
+
+        except Exception as e:
+            log.error(f"[ENTRY] Limit attempt {attempt} error: {e}")
+            time.sleep(1)
+
+    # ---------- MARKET FALLBACK ----------
+    if not filled:
+        try:
+            log.info(f"[ENTRY] Limit attempts failed -> MARKET fallback {signal}")
+            print(f"[{now_str()}] Limit not filled -> MARKET fallback {signal}", flush=True)
+            entry_order = create_market_entry(SYMBOL, side_ccxt, qty)
+        except Exception as e:
+            log.error(f"[ENTRY] Market fallback error: {e}")
+            print(f"[{now_str()}] Market fallback error: {e}", flush=True)
+            return False
+
+    # ---------- DETERMINE ENTRY PRICE ----------
+    try:
+        entry_price_actual = entry_order.get('average') or entry_order.get('price') or (entry_order.get('info') or {}).get('avgPrice')
+    except Exception:
+        entry_price_actual = None
+    if not entry_price_actual:
+        entry_price_actual = approx_price
+    entry_price_actual = float(entry_price_actual)
+
+    # ---------- CALCULATE TP & SL ----------
+    if signal == 'BUY':
+        tp_price = entry_price_actual + TP_POINTS
+        sl_price = entry_price_actual - SL_POINTS
+    else:
+        tp_price = entry_price_actual - TP_POINTS
+        sl_price = entry_price_actual + SL_POINTS
+
+    # ---------- PLACE TP & SL ----------
+    tp_order, sl_order = place_tp_sl(SYMBOL, signal, qty, tp_price, sl_price)
+
+    # ---------- SET GLOBAL POSITION ----------
+    position_local = {
+        'dir': signal,
+        'entry': float(entry_price_actual),
+        'tp_price': float(tp_price),
+        'sl_price': float(sl_price),
+        'entry_time': now_ist(),
+        'entry_id': str(entry_order.get('id')) if entry_order and entry_order.get('id') is not None else None,
+        'tp_id': str(tp_order.get('id')) if tp_order and tp_order.get('id') is not None else None,
+        'sl_id': str(sl_order.get('id')) if sl_order and sl_order.get('id') is not None else None
+    }
+    position = position_local
+    in_position = True
+
+    log.info(f"[OPEN] {signal} entry={position['entry']} tp={position['tp_price']} sl={position['sl_price']} tp_id={position['tp_id']} sl_id={position['sl_id']}")
+    print(f"[{now_str()}] OPENED {signal} entry={position['entry']} tp={position['tp_price']} sl={position['sl_price']}", flush=True)
+    return True
 
 # =================== KLINE WEBSOCKET (public) ===================
 def on_kline_message(ws, message):
@@ -224,56 +389,18 @@ def on_kline_message(ws, message):
                 if last_processed_candle_time == last_iso:
                     return
 
-                entry_price = float(c)  # use closed price as approx (market entry)
-                if signal == 'BUY':
-                    tp_price = entry_price + TP_POINTS
-                    sl_price = entry_price - SL_POINTS
-                else:
-                    tp_price = entry_price - TP_POINTS
-                    sl_price = entry_price + SL_POINTS
+                approx_entry_price = float(c)  # closed candle price as reference
 
-                try:
-                    print(f"[{now_str()}] RSI signal {signal} detected (RSI strategy). Placing market entry...", flush=True)
-                    log.info(f"RSI signal {signal} -> entry at market, tp={tp_price}, sl={sl_price}")
-                    try:
-                        set_leverage(SYMBOL, LEVERAGE)
-                    except Exception:
-                        pass
+                print(f"[{now_str()}] RSI signal {signal} detected (RSI strategy). Using smart limit entry...", flush=True)
+                log.info(f"RSI signal {signal} -> smart limit entry from approx price {approx_entry_price}")
 
-                    side_ccxt = 'buy' if signal == 'BUY' else 'sell'
-                    entry_order = create_market_entry(SYMBOL, side_ccxt, LOT_SIZE)
-
-                    entry_price_actual = None
-                    try:
-                        entry_price_actual = entry_order.get('average') or entry_order.get('price') or (entry_order.get('info') or {}).get('avgPrice')
-                    except Exception:
-                        entry_price_actual = None
-                    if not entry_price_actual:
-                        try:
-                            entry_price_actual = float(k.get('c'))
-                        except:
-                            entry_price_actual = entry_price
-
-                    tp_order, sl_order = place_tp_sl(SYMBOL, signal, LOT_SIZE, tp_price, sl_price)
-                    position = {
-                        'dir': signal,
-                        'entry': float(entry_price_actual),
-                        'tp_price': float(tp_price),
-                        'sl_price': float(sl_price),
-                        'entry_time': now_ist(),
-                        'entry_id': str(entry_order.get('id')) if entry_order and entry_order.get('id') is not None else None,
-                        'tp_id': str(tp_order.get('id')) if tp_order and tp_order.get('id') is not None else None,
-                        'sl_id': str(sl_order.get('id')) if sl_order and sl_order.get('id') is not None else None
-                    }
-                    in_position = True
+                ok = smart_open_position(signal, approx_entry_price)
+                if ok:
                     last_processed_candle_time = last_iso
-                    print(f"[{now_str()}] OPENED {signal} entry={position['entry']} tp_id={position['tp_id']} sl_id={position['sl_id']}", flush=True)
-                    log.info(f"Opened live {signal}: {position}")
-                except Exception as e:
-                    print(f"[{now_str()}] Error placing live trade: {e}", flush=True)
-                    log.error(f"Error placing live trade: {e}")
-                    in_position = False
-                    position = None
+                else:
+                    print(f"[{now_str()}] Failed to open position on signal {signal}", flush=True)
+                    log.error(f"Failed to open position on signal {signal}")
+
         except Exception as e:
             logging.debug(f"kline parse error: {e}")
 
@@ -538,7 +665,7 @@ def monitor_positions_poller(poll_interval=5):
                     for p in pos_list:
                         sym = p.get('symbol')
                         if sym:
-                            if sym == SYMBOL.replace('/', '') or sym == SYMBOL:
+                            if sym == SYMBOL.replace('/','') or sym == SYMBOL:
                                 found = p
                                 break
                     if found:
@@ -568,8 +695,8 @@ def monitor_positions_poller(poll_interval=5):
             time.sleep(1)
 
 # =================== STARTUP ===================
-print(f"[{now_str()}] 🚀 [RSI LIVE BOT] {SYMBOL} | Binance Perpetual | FULL WebSocket Mode (monitor active)", flush=True)
-log.info("Starting full websocket RSI bot with monitor")
+print(f"[{now_str()}] 🚀 [RSI LIVE BOT] {SYMBOL} | Binance Perpetual | Smart LIMIT Entry Mode", flush=True)
+log.info("Starting full websocket RSI bot with smart limit entry + monitor")
 
 with balance_lock:
     current_balance = fetch_usdt_balance()
