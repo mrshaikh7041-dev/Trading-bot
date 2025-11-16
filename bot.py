@@ -15,7 +15,7 @@ from collections import deque
 SYMBOL = 'BNB/USDT'            # trading pair
 WS_SYMBOL = 'bnbusdt'          # for websocket stream (lowercase, no slash)
 TIMEFRAME = '1m'
-LOT_SIZE = 0.02                # your lot size
+LOT_SIZE = 0.02                # your lot size (YEHI DIRECT JAYEGA)
 SL_POINTS = 3.0
 TP_POINTS = 6.0
 LEVERAGE = 75
@@ -33,7 +33,7 @@ LIMIT_BUFFER = 0.02          # price offset for limit orders
 ENTRY_WAIT_SECONDS = 5       # wait after each limit attempt
 MAX_LIMIT_ATTEMPTS = 2       # after 2 attempts -> market fallback
 
-# API KEYS - FILL LOCALLY (REPLACE THESE, and delete old keys from Binance)
+# API KEYS - FILL LOCALLY
 API_KEY = 'czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ'
 API_SECRET = 'cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO'
 
@@ -104,16 +104,7 @@ def append_trade_csv(record):
             writer.writeheader()
         writer.writerow(record)
 
-def _round_amount(symbol, amount):
-    try:
-        market = exchange.markets.get(symbol)
-        precision = market.get('precision', {}).get('amount')
-        if precision is not None:
-            return float(round(amount, int(precision)))
-    except Exception:
-        pass
-    return float(amount)
-
+# qty rounding ab USE nahi ho rahi, sirf price rounding rakha hai
 def _round_price(symbol, price):
     try:
         market = exchange.markets.get(symbol)
@@ -128,20 +119,27 @@ def _round_price(symbol, price):
 def set_leverage(symbol, leverage):
     try:
         sym = symbol.replace('/', '')
-        exchange.fapiPrivate_post_leverage({'symbol': sym, 'leverage': int(leverage)})
+        # ccxt camelCase method
+        exchange.fapiPrivatePostLeverage({'symbol': sym, 'leverage': int(leverage)})
         logging.info(f"Leverage {leverage} set for {symbol}")
     except Exception as e:
         logging.warning(f"Set leverage failed: {e}")
 
 def create_limit_entry(symbol, side_ccxt, amount, limit_price):
-    amount_rounded = _round_amount(symbol, amount)
+    # YAHAN DIRECT amount (LOT_SIZE) use ho raha hai
     limit_price_rounded = _round_price(symbol, limit_price)
-    order = exchange.create_order(symbol, 'limit', side_ccxt, amount_rounded, limit_price_rounded, {'reduceOnly': False})
+    order = exchange.create_order(
+        symbol, 'limit', side_ccxt, amount, limit_price_rounded,
+        {'reduceOnly': False}
+    )
     return order
 
 def create_market_entry(symbol, side_ccxt, amount):
-    amount_rounded = _round_amount(symbol, amount)
-    order = exchange.create_order(symbol, 'market', side_ccxt, amount_rounded, None, {'reduceOnly': False})
+    # YAHAN BHI DIRECT amount
+    order = exchange.create_order(
+        symbol, 'market', side_ccxt, amount, None,
+        {'reduceOnly': False}
+    )
     return order
 
 def place_tp_sl(symbol, dir_signal, amount, tp_price, sl_price):
@@ -150,14 +148,14 @@ def place_tp_sl(symbol, dir_signal, amount, tp_price, sl_price):
     SL = STOP_MARKET reduceOnly
     """
     close_side = 'sell' if dir_signal == 'BUY' else 'buy'
-    amount_rounded = _round_amount(symbol, amount)
-    tp_order = None; sl_order = None
+    tp_order = None
+    sl_order = None
 
     # TP LIMIT reduceOnly
     try:
         tp_price_rounded = _round_price(symbol, tp_price)
         tp_order = exchange.create_order(
-            symbol, 'limit', close_side, amount_rounded, tp_price_rounded,
+            symbol, 'limit', close_side, amount, tp_price_rounded,
             {'reduceOnly': True}
         )
     except Exception as e:
@@ -167,7 +165,7 @@ def place_tp_sl(symbol, dir_signal, amount, tp_price, sl_price):
     try:
         sl_price_rounded = _round_price(symbol, sl_price)
         sl_order = exchange.create_order(
-            symbol, 'STOP_MARKET', close_side, amount_rounded, None,
+            symbol, 'STOP_MARKET', close_side, amount, None,
             {'stopPrice': float(sl_price_rounded), 'reduceOnly': True}
         )
     except Exception as e:
@@ -194,12 +192,6 @@ def compute_rsi_from_deque():
     return df
 
 def check_rsi_signal_from_df(df):
-    """
-    Uses latest closed candle's RSI to decide BUY/SELL.
-    BUY  if RSI < RSI_LOW
-    SELL if RSI > RSI_HIGH
-    Else None
-    """
     try:
         last = df.iloc[-1]
         r = float(last['rsi'])
@@ -226,14 +218,13 @@ def smart_open_position(signal, approx_price):
     global in_position, position
 
     side_ccxt = 'buy' if signal == 'BUY' else 'sell'
-    qty = LOT_SIZE
+    qty = LOT_SIZE  # EXACT qty
 
     try:
         set_leverage(SYMBOL, LEVERAGE)
     except Exception:
         pass
 
-    # Helper to derive limit price based on direction
     def get_limit_price(base_price):
         if signal == 'BUY':
             return base_price + LIMIT_BUFFER
@@ -244,7 +235,6 @@ def smart_open_position(signal, approx_price):
     filled = False
     entry_price_actual = None
 
-    # ---------- LIMIT ATTEMPTS ----------
     current_price_ref = approx_price
     for attempt in range(1, MAX_LIMIT_ATTEMPTS + 1):
         try:
@@ -255,7 +245,6 @@ def smart_open_position(signal, approx_price):
             order = create_limit_entry(SYMBOL, side_ccxt, qty, limit_price)
             order_id = str(order.get('id')) if order and order.get('id') is not None else None
 
-            # Wait ENTRY_WAIT_SECONDS checking status
             t0 = time.time()
             while time.time() - t0 < ENTRY_WAIT_SECONDS:
                 time.sleep(1)
@@ -269,13 +258,11 @@ def smart_open_position(signal, approx_price):
                         filled = True
                         break
                 except Exception:
-                    # ignore and continue polling
                     pass
 
             if filled:
                 break
 
-            # Not filled -> cancel and try again with fresh price
             if order_id:
                 try:
                     exchange.cancel_order(order_id, SYMBOL)
@@ -283,21 +270,18 @@ def smart_open_position(signal, approx_price):
                 except Exception as e:
                     log.warning(f"[ENTRY] Cancel failed for {order_id}: {e}")
 
-            # update reference price from ticker for next attempt
             try:
                 ticker = exchange.fetch_ticker(SYMBOL)
                 last = ticker.get('last') or ticker.get('close')
                 if last:
                     current_price_ref = float(last)
             except Exception:
-                # fallback keep previous
                 pass
 
         except Exception as e:
             log.error(f"[ENTRY] Limit attempt {attempt} error: {e}")
             time.sleep(1)
 
-    # ---------- MARKET FALLBACK ----------
     if not filled:
         try:
             log.info(f"[ENTRY] Limit attempts failed -> MARKET fallback {signal}")
@@ -308,7 +292,6 @@ def smart_open_position(signal, approx_price):
             print(f"[{now_str()}] Market fallback error: {e}", flush=True)
             return False
 
-    # ---------- DETERMINE ENTRY PRICE ----------
     try:
         entry_price_actual = entry_order.get('average') or entry_order.get('price') or (entry_order.get('info') or {}).get('avgPrice')
     except Exception:
@@ -317,7 +300,6 @@ def smart_open_position(signal, approx_price):
         entry_price_actual = approx_price
     entry_price_actual = float(entry_price_actual)
 
-    # ---------- CALCULATE TP & SL ----------
     if signal == 'BUY':
         tp_price = entry_price_actual + TP_POINTS
         sl_price = entry_price_actual - SL_POINTS
@@ -325,10 +307,8 @@ def smart_open_position(signal, approx_price):
         tp_price = entry_price_actual - TP_POINTS
         sl_price = entry_price_actual + SL_POINTS
 
-    # ---------- PLACE TP & SL ----------
     tp_order, sl_order = place_tp_sl(SYMBOL, signal, qty, tp_price, sl_price)
 
-    # ---------- SET GLOBAL POSITION ----------
     position_local = {
         'dir': signal,
         'entry': float(entry_price_actual),
@@ -348,11 +328,6 @@ def smart_open_position(signal, approx_price):
 
 # =================== KLINE WEBSOCKET (public) ===================
 def on_kline_message(ws, message):
-    """
-    Handle public kline stream messages.
-    We append closed kline to kline_deque when 'k'['x'] == True
-    Then calculate RSI-Wilder and generate signal.
-    """
     try:
         data = json.loads(message)
     except Exception as e:
@@ -369,7 +344,7 @@ def on_kline_message(ws, message):
     if is_closed:
         try:
             o = float(k.get('o')); h = float(k.get('h')); l = float(k.get('l')); c = float(k.get('c')); v = float(k.get('v'))
-            t = int(k.get('t'))  # start time in ms
+            t = int(k.get('t'))
             kline_deque.append([o,h,l,c,v,t])
 
             df = compute_rsi_from_deque()
@@ -385,12 +360,10 @@ def on_kline_message(ws, message):
                 return
 
             if signal and not in_position:
-                # avoid double entry on same candle
                 if last_processed_candle_time == last_iso:
                     return
 
-                approx_entry_price = float(c)  # closed candle price as reference
-
+                approx_entry_price = float(c)
                 print(f"[{now_str()}] RSI signal {signal} detected (RSI strategy). Using smart limit entry...", flush=True)
                 log.info(f"RSI signal {signal} -> smart limit entry from approx price {approx_entry_price}")
 
@@ -520,7 +493,8 @@ def start_user_ws():
     global listen_key, ws_user, stop_all
     while not stop_all:
         try:
-            res = exchange.fapiPrivate_post_listenKey()
+            # ccxt camelCase method
+            res = exchange.fapiPrivatePostListenKey()
             if isinstance(res, dict):
                 lk = res.get('listenKey')
             else:
@@ -551,7 +525,8 @@ def listenkey_keepalive_worker(lk):
     while not stop_all:
         try:
             time.sleep(60 * 25)
-            exchange.fapiPrivate_put_listenKey({'listenKey': lk})
+            # ccxt camelCase method
+            exchange.fapiPrivatePutListenKey({'listenKey': lk})
             logging.debug("Sent listenKey keepalive")
         except Exception as e:
             logging.debug(f"listenKey keepalive error: {e}")
@@ -652,7 +627,8 @@ def monitor_positions_poller(poll_interval=5):
             try:
                 pos_list = None
                 try:
-                    pos_list = exchange.fapiPrivate_get_positionrisk()
+                    # ccxt camelCase method for position risk
+                    pos_list = exchange.fapiPrivateGetPositionRisk()
                 except Exception:
                     pos_list = None
                 if not pos_list:
