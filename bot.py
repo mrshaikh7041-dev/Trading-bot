@@ -17,7 +17,7 @@ WS_SYMBOL = 'bnbusdt'          # for websocket stream (lowercase, no slash)
 TIMEFRAME = '1m'
 LOT_SIZE = 0.02                # your lot size (YEHI DIRECT JAYEGA)
 SL_POINTS = 3.0
-TP_POINTS = 6.0
+TP_POINTS = 5.9
 LEVERAGE = 75
 COOLDOWN_MINUTES = 30
 CSV_FN = f'{SYMBOL.replace("/", "-")}_trades.csv'
@@ -29,7 +29,7 @@ RSI_LOW = 20
 RSI_HIGH = 60
 
 # 🔹 LIMIT ENTRY CONFIG
-LIMIT_BUFFER = 0.02          # price offset for limit orders
+LIMIT_BUFFER = 0.10          # price offset for limit orders
 ENTRY_WAIT_SECONDS = 5       # wait after each limit attempt
 MAX_LIMIT_ATTEMPTS = 2       # after 2 attempts -> market fallback
 
