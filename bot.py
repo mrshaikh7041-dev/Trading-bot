@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 # =============== USER CONFIG ===============
 SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
-LOT_SIZE = 0.02          # EXACT yehi qty order me jayegi
+LOT_SIZE = 0.01          # EXACT yehi qty order me jayegi
 RSI_PERIOD = 14
 RSI_LOW = 20
 RSI_HIGH = 60
