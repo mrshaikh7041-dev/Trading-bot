@@ -8,19 +8,19 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =============== USER CONFIG ===============
-SYMBOL = "BNB/USDT"
+SYMBOL = "BNB/USDT"       # yaha typo tha: USUT -> USDT
 TIMEFRAME = "1m"
-LOT_SIZE = 0.01          # EXACT yehi qty order me jayegi
+LOT_SIZE = 0.01           # EXACT yehi qty order me jayegi
 RSI_PERIOD = 14
 RSI_LOW = 20
 RSI_HIGH = 60
 TP_POINTS = 6.0
 SL_POINTS = 3.0
-POLL_INTERVAL = 2        # seconds
+POLL_INTERVAL = 2         # seconds
 
 # Path agar chaho to change kar sakta hai
 LOG_FILE = "/home/ubuntu/Trading-bot/bot.log"
-CSV_FILE = f"{SYMBOL.replace("/", "-")}_trades.csv"
+CSV_FILE = f"{SYMBOL.replace('/', '-')}_trades.csv"
 
 API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
 API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
@@ -35,11 +35,15 @@ log = logging.getLogger(__name__)
 
 # =============== TIME HELPERS ===============
 IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def now_ist():
     return datetime.now(timezone.utc).astimezone(IST)
 
+
 def now_str():
     return now_ist().strftime("%Y-%m-%d %H:%M:%S %Z")
+
 
 # =============== EXCHANGE SETUP ===============
 exchange = ccxt.binance({
@@ -60,7 +64,7 @@ except Exception as e:
 
 # =============== STATE ===============
 in_position = False
-current_position = None   # dict: side, entry, time
+current_position = None        # dict: side, entry, time, tp/sl ids...
 last_entry_candle_time = None  # ms of last candle where we entered
 
 # =============== HELPERS ===============
@@ -72,6 +76,7 @@ def append_csv(row: dict):
             w.writeheader()
         w.writerow(row)
 
+
 def rsi_wilder(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
@@ -79,11 +84,13 @@ def rsi_wilder(series: pd.Series, period: int = 14) -> pd.Series:
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
+
 def place_market_entry(side: str, approx_price: float) -> float:
     params = {"reduceOnly": False}
     order = exchange.create_order(SYMBOL, "market", side.lower(), LOT_SIZE, None, params)
     entry = order.get("average") or order.get("price") or approx_price
     return float(entry)
+
 
 def place_tp_sl(side: str, entry: float):
     """
@@ -92,6 +99,7 @@ def place_tp_sl(side: str, entry: float):
     SL = entry ∓ SL_POINTS
     """
     close_side = "sell" if side == "BUY" else "buy"
+
     if side == "BUY":
         tp_price = entry + TP_POINTS
         sl_price = entry - SL_POINTS
@@ -104,11 +112,15 @@ def place_tp_sl(side: str, entry: float):
         SYMBOL, "limit", close_side, LOT_SIZE, tp_price,
         {"reduceOnly": True}
     )
+
+    # ccxt unified type: stop_market (Binance futures)
     sl_order = exchange.create_order(
-        SYMBOL, "STOP_MARKET", close_side, LOT_SIZE, None,
+        SYMBOL, "stop_market", close_side, LOT_SIZE, None,
         {"stopPrice": sl_price, "reduceOnly": True}
     )
+
     return tp_order.get("id"), sl_order.get("id"), tp_price, sl_price
+
 
 def fetch_position_size() -> float:
     """
@@ -132,6 +144,7 @@ def fetch_position_size() -> float:
             return float(size or 0)
     return 0.0
 
+
 def check_position_closed():
     global in_position, current_position
 
@@ -147,7 +160,7 @@ def check_position_closed():
         entry = current_position["entry"]
         side = current_position["side"]
         pnl = (exit_price - entry) * LOT_SIZE if side == "BUY" \
-              else (entry - exit_price) * LOT_SIZE
+            else (entry - exit_price) * LOT_SIZE
 
         row = {
             "time": current_position["time"],
@@ -163,6 +176,7 @@ def check_position_closed():
         in_position = False
         current_position = None
 
+
 # =============== MAIN LOOP ===============
 print(f"[{now_str()}] 🚀 RSI LIVE BOT STARTED | {SYMBOL} | MARKET ONLY (polling)", flush=True)
 log.info("Bot started for %s", SYMBOL)
@@ -171,7 +185,7 @@ while True:
     try:
         # ---------------- CANDLES + RSI ----------------
         ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=RSI_PERIOD + 5)
-        df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
+        df = pd.DataFrame(ohlc, columns=["time", "open", "high", "low", "close", "volume"])
         df["rsi"] = rsi_wilder(df["close"], RSI_PERIOD)
 
         # last closed candle = second last row (last is still forming)
@@ -187,62 +201,47 @@ while True:
         # ---------------- ENTRY LOGIC ----------------
         if not in_position:
             signal = None
+
             if rsi < RSI_LOW:
                 signal = "BUY"
             elif rsi > RSI_HIGH:
                 signal = "SELL"
 
-if signal and not in_position and last_entry_candle_time != candle_time:
+            # candle lock + position lock
+            if signal and last_entry_candle_time != candle_time:
+                last_entry_candle_time = candle_time  # 🔐 candle lock immediately
 
-    last_entry_candle_time = candle_time  # 🔐 candle lock immediately
+                print(
+                    f"[{now_str()}] SIGNAL {signal} @ {close_price:.4f} | RSI={rsi:.2f}",
+                    flush=True
+                )
+                log.info("Signal %s at price %.4f RSI=%.2f", signal, close_price, rsi)
 
-    print(f"[{now_str()}] SIGNAL {signal} @ {close_price:.4f} | RSI={rsi:.2f}", flush=True)
-    log.info("Signal %s at price %.4f RSI=%.2f", signal, close_price, rsi)
+                entry_price = place_market_entry(signal, close_price)
+                tp_id, sl_id, tp_price, sl_price = place_tp_sl(signal, entry_price)
 
-    entry_price = place_market_entry(signal, close_price)
-    tp_id, sl_id, tp_price, sl_price = place_tp_sl(signal, entry_price)
+                current_position = {
+                    "side": signal,
+                    "entry": entry_price,
+                    "time": now_ist().isoformat(),
+                    "tp_id": tp_id,
+                    "sl_id": sl_id,
+                    "tp_price": tp_price,
+                    "sl_price": sl_price,
+                    "candle_time": candle_time,
+                }
 
-    current_position = {
-        "side": signal,
-        "entry": entry_price,
-        "time": now_ist().isoformat(),
-        "tp_id": tp_id,
-        "sl_id": sl_id,
-        "tp_price": tp_price,
-        "sl_price": sl_price,
-        "candle_time": candle_time,
-    }
+                in_position = True  # 🔐 position lock
 
-    in_position = True  # 🔐 position lock
-
-    print(
-        f"[{now_str()}] ENTER {signal} @ {entry_price:.4f} | TP={tp_price:.4f} SL={sl_price:.4f}",
-        flush=True
-    )
-    log.info("Enter %s @ %.4f TP=%.4f SL=%.4f",
-             signal, entry_price, tp_price, sl_price)
-
-                    current_position = {
-                        "side": signal,
-                        "entry": entry_price,
-                        "time": now_ist().isoformat(),
-                        "tp_id": tp_id,
-                        "sl_id": sl_id,
-                        "tp_price": tp_price,
-                        "sl_price": sl_price,
-                        "candle_time": candle_time,
-                    }
-                    in_position = True
-                    last_entry_candle_time = candle_time
-
-                    print(
-                        f"[{now_str()}] ENTER {signal} @ {entry_price:.4f} | TP={tp_price:.4f} SL={sl_price:.4f}",
-                        flush=True
-                    )
-                    log.info(
-                        "Enter %s @ %.4f TP=%.4f SL=%.4f",
-                        signal, entry_price, tp_price, sl_price
-                    )
+                print(
+                    f"[{now_str()}] ENTER {signal} @ {entry_price:.4f} | "
+                    f"TP={tp_price:.4f} SL={sl_price:.4f}",
+                    flush=True
+                )
+                log.info(
+                    "Enter %s @ %.4f TP=%.4f SL=%.4f",
+                    signal, entry_price, tp_price, sl_price
+                )
 
         time.sleep(POLL_INTERVAL)
 
