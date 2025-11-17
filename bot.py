@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 # =============== USER CONFIG ===============
 SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
-LOT_SIZE = 0.02          # EXACT yehi qty order me jayegi
+LOT_SIZE = 0.01          # EXACT yehi qty order me jayegi
 RSI_PERIOD = 14
 RSI_LOW = 20
 RSI_HIGH = 60
@@ -192,7 +192,7 @@ while True:
             elif rsi > RSI_HIGH:
                 signal = "SELL"
 
-            if signal and not in_position and last_entry_candle_time != candle_time:
+if signal and not in_position and last_entry_candle_time != candle_time:
 
     last_entry_candle_time = candle_time  # 🔐 candle lock immediately
 
@@ -214,11 +214,13 @@ while True:
     }
 
     in_position = True  # 🔐 position lock
-                    print(f"[{now_str()}] SIGNAL {signal} @ {close_price:.4f} | RSI={rsi:.2f}", flush=True)
-                    log.info("Signal %s at price %.4f RSI=%.2f", signal, close_price, rsi)
 
-                    entry_price = place_market_entry(signal, close_price)
-                    tp_id, sl_id, tp_price, sl_price = place_tp_sl(signal, entry_price)
+    print(
+        f"[{now_str()}] ENTER {signal} @ {entry_price:.4f} | TP={tp_price:.4f} SL={sl_price:.4f}",
+        flush=True
+    )
+    log.info("Enter %s @ %.4f TP=%.4f SL=%.4f",
+             signal, entry_price, tp_price, sl_price)
 
                     current_position = {
                         "side": signal,
