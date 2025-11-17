@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =============== USER CONFIG ===============
-SYMBOL = "BNB/USUT"
+SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
 LOT_SIZE = 0.02          # EXACT yehi qty order me jayegi
 RSI_PERIOD = 14
