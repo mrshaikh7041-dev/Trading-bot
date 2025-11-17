@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =============== USER CONFIG ===============
-SYMBOL = "BNB/USDT"       # yaha typo tha: USUT -> USDT
+SYMBOL = "BNB/USDT"       # Typo fix: USUT -> USDT
 TIMEFRAME = "1m"
 LOT_SIZE = 0.01           # EXACT yehi qty order me jayegi
 RSI_PERIOD = 14
@@ -50,7 +50,7 @@ exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "future"},
+    "options": {"defaultType": "future"},   # ✅ Futures trading
 })
 exchange.options["adjustForTimeDifference"] = True
 exchange.load_markets()
@@ -113,7 +113,7 @@ def place_tp_sl(side: str, entry: float):
         {"reduceOnly": True}
     )
 
-    # ccxt unified type: stop_market (Binance futures)
+    # unified type: stop_market (Binance futures)
     sl_order = exchange.create_order(
         SYMBOL, "stop_market", close_side, LOT_SIZE, None,
         {"stopPrice": sl_price, "reduceOnly": True}
@@ -124,7 +124,7 @@ def place_tp_sl(side: str, entry: float):
 
 def fetch_position_size() -> float:
     """
-    Uses unified fetch_positions so koi fapiPrivate* confusion nahi.
+    Uses unified fetch_positions.
     Returns contracts amount (positive long, negative short).
     """
     try:
@@ -207,9 +207,12 @@ while True:
             elif rsi > RSI_HIGH:
                 signal = "SELL"
 
-            # candle lock + position lock
+            # ✅ DOUBLE-ENTRY PROTECTION:
+            # 1) position lock first
+            # 2) candle lock first
             if signal and last_entry_candle_time != candle_time:
-                last_entry_candle_time = candle_time  # 🔐 candle lock immediately
+                in_position = True                      # 🔐 position lock
+                last_entry_candle_time = candle_time    # 🔐 candle lock
 
                 print(
                     f"[{now_str()}] SIGNAL {signal} @ {close_price:.4f} | RSI={rsi:.2f}",
@@ -217,31 +220,36 @@ while True:
                 )
                 log.info("Signal %s at price %.4f RSI=%.2f", signal, close_price, rsi)
 
-                entry_price = place_market_entry(signal, close_price)
-                tp_id, sl_id, tp_price, sl_price = place_tp_sl(signal, entry_price)
+                try:
+                    entry_price = place_market_entry(signal, close_price)
+                    tp_id, sl_id, tp_price, sl_price = place_tp_sl(signal, entry_price)
 
-                current_position = {
-                    "side": signal,
-                    "entry": entry_price,
-                    "time": now_ist().isoformat(),
-                    "tp_id": tp_id,
-                    "sl_id": sl_id,
-                    "tp_price": tp_price,
-                    "sl_price": sl_price,
-                    "candle_time": candle_time,
-                }
+                    current_position = {
+                        "side": signal,
+                        "entry": entry_price,
+                        "time": now_ist().isoformat(),
+                        "tp_id": tp_id,
+                        "sl_id": sl_id,
+                        "tp_price": tp_price,
+                        "sl_price": sl_price,
+                        "candle_time": candle_time,
+                    }
 
-                in_position = True  # 🔐 position lock
+                    print(
+                        f"[{now_str()}] ENTER {signal} @ {entry_price:.4f} | "
+                        f"TP={tp_price:.4f} SL={sl_price:.4f}",
+                        flush=True
+                    )
+                    log.info(
+                        "Enter %s @ %.4f TP=%.4f SL=%.4f",
+                        signal, entry_price, tp_price, sl_price
+                    )
 
-                print(
-                    f"[{now_str()}] ENTER {signal} @ {entry_price:.4f} | "
-                    f"TP={tp_price:.4f} SL={sl_price:.4f}",
-                    flush=True
-                )
-                log.info(
-                    "Enter %s @ %.4f TP=%.4f SL=%.4f",
-                    signal, entry_price, tp_price, sl_price
-                )
+                except Exception as e:
+                    # ❌ Agar entry / tp/sl fail ho jaye → position unlock
+                    in_position = False
+                    print(f"[{now_str()}] ⚠️ Entry failed: {e}", flush=True)
+                    log.error("Entry failed: %s", e)
 
         time.sleep(POLL_INTERVAL)
 
