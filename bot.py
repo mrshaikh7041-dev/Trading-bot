@@ -8,9 +8,9 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =============== USER CONFIG ===============
-SYMBOL = "BNB/USDT"
+SYMBOL = "BNB/USUT"
 TIMEFRAME = "1m"
-LOT_SIZE = 0.01          # EXACT yehi qty order me jayegi
+LOT_SIZE = 0.02          # EXACT yehi qty order me jayegi
 RSI_PERIOD = 14
 RSI_LOW = 20
 RSI_HIGH = 60
@@ -192,11 +192,28 @@ while True:
             elif rsi > RSI_HIGH:
                 signal = "SELL"
 
-            if signal:
-                # avoid more than 1 entry on same candle
-                if last_entry_candle_time == candle_time:
-                    pass
-                else:
+            if signal and not in_position and last_entry_candle_time != candle_time:
+
+    last_entry_candle_time = candle_time  # 🔐 candle lock immediately
+
+    print(f"[{now_str()}] SIGNAL {signal} @ {close_price:.4f} | RSI={rsi:.2f}", flush=True)
+    log.info("Signal %s at price %.4f RSI=%.2f", signal, close_price, rsi)
+
+    entry_price = place_market_entry(signal, close_price)
+    tp_id, sl_id, tp_price, sl_price = place_tp_sl(signal, entry_price)
+
+    current_position = {
+        "side": signal,
+        "entry": entry_price,
+        "time": now_ist().isoformat(),
+        "tp_id": tp_id,
+        "sl_id": sl_id,
+        "tp_price": tp_price,
+        "sl_price": sl_price,
+        "candle_time": candle_time,
+    }
+
+    in_position = True  # 🔐 position lock
                     print(f"[{now_str()}] SIGNAL {signal} @ {close_price:.4f} | RSI={rsi:.2f}", flush=True)
                     log.info("Signal %s at price %.4f RSI=%.2f", signal, close_price, rsi)
 
