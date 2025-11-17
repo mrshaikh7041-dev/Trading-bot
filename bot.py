@@ -8,14 +8,14 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =============== USER CONFIG ===============
-SYMBOL = "BNB/USDT"       # Typo fix: USUT -> USDT
-TIMEFRAME = "1m"
-LOT_SIZE = 0.01           # EXACT yehi qty order me jayegi
+SYMBOL = "XRP/USDT"       # Typo fix: USUT -> USDT
+TIMEFRAME = "3m"
+LOT_SIZE = 4           # EXACT yehi qty order me jayegi
 RSI_PERIOD = 14
 RSI_LOW = 20
 RSI_HIGH = 60
-TP_POINTS = 6.0
-SL_POINTS = 3.0
+TP_POINTS = 0.0076
+SL_POINTS = 0.0038
 POLL_INTERVAL = 2         # seconds
 
 # Path agar chaho to change kar sakta hai
@@ -57,8 +57,8 @@ exchange.load_markets()
 
 # Try setting leverage once (ignore error if not supported)
 try:
-    exchange.set_leverage(75, SYMBOL)
-    log.info("Leverage set to 75 for %s", SYMBOL)
+    exchange.set_leverage(100, SYMBOL)
+    log.info("Leverage set to 100 for %s", SYMBOL)
 except Exception as e:
     log.warning("set_leverage failed: %s", e)
 
