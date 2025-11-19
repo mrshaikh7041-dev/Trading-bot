@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 # =============== USER CONFIG ===============
 SYMBOL = "XRP/USDT"
 TIMEFRAME = "1m"          # Backtest-tested TF (can change to "3m" if you want)
-LOT_SIZE = 50.0           # XRP quantity per trade (change here if needed)
+LOT_SIZE = 5.0           # XRP quantity per trade (change here if needed)
 RSI_PERIOD = 14
 RSI_LOW = 10              # Reversal zone low
 RSI_HIGH = 37             # Reversal zone high
