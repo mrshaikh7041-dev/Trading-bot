@@ -24,8 +24,8 @@ COOLDOWN_MINUTES = 15    # only after SL
 LOG_FILE = "/home/ubuntu/Trading-bot/bot.log"
 CSV_FILE = f"{SYMBOL.replace('/', '-')}_trades.csv"
 
-API_KEY = "YOUR_API_KEY"
-API_SECRET = "YOUR_API_SECRET"
+API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
+API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
 
 # ================= LOGGING =================
 logging.basicConfig(
