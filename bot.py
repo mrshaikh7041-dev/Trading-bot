@@ -8,15 +8,15 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # =============== USER CONFIG ===============
-SYMBOL = "XRP/USDT"
+SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
-LOT_SIZE = 5.0                # XRP per trade
+LOT_SIZE = 0.03                # XRP per trade
 RSI_PERIOD = 14
 RSI_LOW = 10                  # Reversal zone low
 RSI_HIGH = 37                 # Reversal zone high
 
-TP_POINTS = 0.032             # TP distance
-SL_POINTS = 0.016             # SL distance
+TP_POINTS = 8             # TP distance
+SL_POINTS = 4             # SL distance
 POLL_INTERVAL = 2             # seconds
 COOLDOWN_MINUTES = 15         # only after SL
 
