@@ -11,15 +11,15 @@ from datetime import datetime, timezone, timedelta
 SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 0.02          # qty send in market order
+LOT_SIZE = 0.02           # qty send in market order
 RSI_PERIOD = 14
-RSI_LOW = 10
-RSI_HIGH = 37
+RSI_LOW = 10              # reversal zone low
+RSI_HIGH = 37             # reversal zone high
 
-TP_POINTS = 8.0          # +8$ TP
-SL_POINTS = 4.0          # -4$ SL
-POLL_INTERVAL = 2        # seconds
-COOLDOWN_MINUTES = 15    # only after SL
+TP_POINTS = 8.0           # +8$ TP
+SL_POINTS = 4.0           # -4$ SL
+POLL_INTERVAL = 2         # seconds
+COOLDOWN_MINUTES = 15     # only after SL
 
 LOG_FILE = "/home/ubuntu/Trading-bot/bot.log"
 CSV_FILE = f"{SYMBOL.replace('/', '-')}_trades.csv"
@@ -65,9 +65,9 @@ except Exception as e:
 
 # ================= STATE =================
 in_position = False
-current_position = None       # {side, entry, qty, tp_price, sl_price, time}
-last_entry_signal_candle = None   # candle time jisme SIGNAL confirm hua
-cooldown_until_utc = None
+current_position = None          # {side, entry, qty, tp_price, sl_price, time}
+last_entry_signal_candle = None  # jis candle pe signal confirm hua
+cooldown_until_utc = None        # SL ke baad next allowed entry time (UTC)
 
 
 # ================= HELPERS =================
@@ -90,7 +90,7 @@ def rsi_wilder(series: pd.Series, period: int = 14) -> pd.Series:
 
 def fetch_position_size() -> float:
     """
-    Monitor ka kaam: exchange par actual position size kya hai.
+    MONITOR: exchange par actual position size kya hai.
     Positive = long, negative = short.
     """
     try:
@@ -106,16 +106,15 @@ def fetch_position_size() -> float:
                 try:
                     size = float(p.get("info", {}).get("positionAmt", 0))
                 except Exception:
-                    size = 0
-            return float(size or 0)
+                    size = 0.0
+            return float(size or 0.0)
     return 0.0
 
 
 def place_entry_with_tp_sl(side: str, approx_price: float):
     """
-    Ek hi function:
-      1) Market entry
-      2) Ussi filled qty se TP/SL reduceOnly order place
+    1) Market entry
+    2) Ussi filled qty se TP/SL reduceOnly order place
 
     Return: entry_price, qty, tp_price, sl_price
     """
@@ -180,9 +179,10 @@ def check_position_closed():
     """
     MONITOR:
       - position close detect kare
-      - TP/SL ka approx identify kare
+      - TP/SL approx identify kare
       - SL ho to cooldown lagaye
       - CSV + print logs
+      - Bot ko inform kare: ab entry allowed / cooldown
     """
     global in_position, current_position, cooldown_until_utc
 
@@ -204,17 +204,22 @@ def check_position_closed():
     entry = current_position["entry"]
     side = current_position["side"]
     qty = current_position["qty"]
-    tp_price = current_position["tp_price"]
-    sl_price = current_position["sl_price"]
+    tp_price = current_position.get("tp_price")
+    sl_price = current_position.get("sl_price")
 
     pnl = (exit_price - entry) * qty if side == "BUY" else (entry - exit_price) * qty
 
-    # TP hit ya SL hit approx (jo price ke jyada close hai)
-    dist_tp = abs(exit_price - tp_price)
-    dist_sl = abs(exit_price - sl_price)
-    hit_sl = dist_sl < dist_tp
+    reason = "UNKNOWN"
+    if tp_price is not None and sl_price is not None:
+        # TP hit ya SL hit approx (jo price ke jyada close hai)
+        dist_tp = abs(exit_price - tp_price)
+        dist_sl = abs(exit_price - sl_price)
+        if dist_sl < dist_tp:
+            reason = "SL"
+        else:
+            reason = "TP"
 
-    if hit_sl:
+    if reason == "SL":
         cooldown_until_utc = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
         log.info("SL hit, cooldown until %s UTC", cooldown_until_utc.isoformat())
 
@@ -225,14 +230,14 @@ def check_position_closed():
         "entry": entry,
         "exit": exit_price,
         "pnl": round(pnl, 6),
-        "reason": "SL" if hit_sl else "TP",
+        "reason": reason,
     }
     append_csv(row)
 
-    print(f"[{now_str()}] EXIT {side} @ {exit_price:.4f} | PNL={pnl:.4f} | {'SL' if hit_sl else 'TP'}",
+    print(f"[{now_str()}] EXIT {side} @ {exit_price:.4f} | PNL={pnl:.4f} | {reason}",
           flush=True)
     log.info("Exit %s @ %.4f | PNL=%.6f | %s",
-             side, exit_price, pnl, "SL" if hit_sl else "TP")
+             side, exit_price, pnl, reason)
 
     in_position = False
     current_position = None
@@ -246,30 +251,33 @@ while True:
     try:
         now_utc = datetime.now(timezone.utc)
 
-        # ---------- MONITOR: sync with exchange ----------
+        # ---------- MONITOR: EXCHANGE STATE = TRUTH ----------
         ex_size = fetch_position_size()
-        if abs(ex_size) > 1e-8 and not in_position:
-            # exchange par position hai, bot ko pata nahi tha
-            in_position = True
-            log.warning("Monitor: found open position on exchange (size=%.4f). Locking entries.", ex_size)
 
+        # Agar exchange par position hai → bot ko in_position TRUE rakhna hi hai
+        if abs(ex_size) > 1e-8 and not in_position:
+            in_position = True
+            # Agar current_position None hai, phir bhi bot entries band rakhega
+            log.warning("Monitor: found open position on exchange (size=%.4f). Entries locked.", ex_size)
+
+        # Agar exchange par position nahi, par in_position True & current_position None
+        # => cleanup
         if abs(ex_size) < 1e-8 and in_position and current_position is None:
-            # position close ho chuki, state clean
             in_position = False
 
-        # agar position open hai -> sirf monitor, koi entry nahi
+        # agar position open hai -> BOT KO SIRF MONITOR MODE PAR RAKHO
         if in_position:
             check_position_closed()
             time.sleep(POLL_INTERVAL)
             continue
 
-        # ---------- COOLDOWN ----------
+        # ---------- COOLDOWN AFTER SL ----------
         if cooldown_until_utc and now_utc < cooldown_until_utc:
             # SL ke baad wait
             time.sleep(POLL_INTERVAL)
             continue
 
-        # ---------- CANDLES + RSI ----------
+        # ---------- CANDLES + RSI (signal part) ----------
         ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=RSI_PERIOD + 5)
         df = pd.DataFrame(ohlc, columns=["time", "open", "high", "low", "close", "volume"])
         df["rsi"] = rsi_wilder(df["close"], RSI_PERIOD)
@@ -278,7 +286,6 @@ while True:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # NOTE:
         # index: -3 = prev closed, -2 = last closed, -1 = current forming
         prev_row = df.iloc[-3]
         last_closed = df.iloc[-2]
@@ -289,27 +296,27 @@ while True:
         candle_time = int(last_closed["time"])
         next_open_price = float(curr_forming["open"])
 
-        # ---------- ENTRY SIGNAL (confirmation candle) ----------
+        # ---------- ENTRY SIGNAL (RSI exit->reenter confirmation) ----------
         signal = None
 
-        # BUY signal: pehle <10 tha, ab >10 (return from below)
-        if prev_rsi < RSI_LOW and last_rsi > RSI_LOW:
+        # BUY: pehle <10 tha, ab >10 & <37 (zone ke andar close)
+        if prev_rsi < RSI_LOW and last_rsi > RSI_LOW and last_rsi < RSI_HIGH:
             signal = "BUY"
 
-        # SELL signal: pehle >37 tha, ab <37 (return from above)
-        elif prev_rsi > RSI_HIGH and last_rsi < RSI_HIGH:
+        # SELL: pehle >37 tha, ab <37 & >10 (zone ke andar close)
+        elif prev_rsi > RSI_HIGH and last_rsi < RSI_HIGH and last_rsi > RSI_LOW:
             signal = "SELL"
 
-        # Same candle me dobara trade nahi
+        # Same candle par double signal se bachne ke liye
         if signal and last_entry_signal_candle == candle_time:
             signal = None
 
-        # ---------- ENTRY EXECUTION ON NEXT OPEN ----------
+        # ---------- ENTRY EXECUTION ON NEXT OPEN (BOT PART) ----------
         if signal:
-            # monitor se double-check: exchange par abhi bhi position zero hai
+            # Monitor se final permission: exchange par position zero hona chahiye
             ex_size = fetch_position_size()
             if abs(ex_size) > 1e-8:
-                log.warning("Signal %s skipped: exchange shows open position size=%.4f", signal, ex_size)
+                log.warning("Signal %s skipped: monitor says position exists (size=%.4f)", signal, ex_size)
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -321,10 +328,14 @@ while True:
             log.info("Signal %s at next-open approx %.4f (RSI prev=%.2f last=%.2f)",
                      signal, next_open_price, prev_rsi, last_rsi)
 
+            entry_price = None
+            qty = LOT_SIZE
+
             try:
-                # entry + tp/sl ek sath
+                # BOT: ek hi baar order send karega
                 entry_price, qty, tp_price, sl_price = place_entry_with_tp_sl(signal, next_open_price)
 
+                # Ab se MONITOR boss hai:
                 current_position = {
                     "side": signal,
                     "entry": entry_price,
@@ -347,10 +358,43 @@ while True:
                 )
 
             except Exception as e:
-                in_position = False
-                current_position = None
-                print(f"[{now_str()}] ⚠️ Entry/TP/SL failed: {e}", flush=True)
-                log.error("Entry/TP/SL failed: %s", e)
+                # AB YAHAN SE BHI MONITOR DECIDE KAREGA
+                size_after_fail = fetch_position_size()
+                if abs(size_after_fail) > 1e-8:
+                    # Entry ho chuki hai, TP/SL fail hua → monitor lock
+                    in_position = True
+                    if entry_price is None:
+                        try:
+                            t = exchange.fetch_ticker(SYMBOL)
+                            entry_price_guess = float(t.get("last") or t.get("close"))
+                        except Exception:
+                            entry_price_guess = next_open_price
+                    else:
+                        entry_price_guess = entry_price
+
+                    current_position = {
+                        "side": signal,
+                        "entry": entry_price_guess,
+                        "qty": size_after_fail,
+                        "time": now_ist().isoformat(),
+                        "tp_price": None,
+                        "sl_price": None,
+                    }
+                    print(
+                        f"[{now_str()}] ⚠️ TP/SL failed but entry EXISTS "
+                        f"(size={size_after_fail:.4f}). Monitor lock ON.",
+                        flush=True
+                    )
+                    log.warning(
+                        "TP/SL failed but entry exists (size=%.4f). Locked state. Error=%s",
+                        size_after_fail, e
+                    )
+                else:
+                    # Pure fail, entry bhi nahi
+                    in_position = False
+                    current_position = None
+                    print(f"[{now_str()}] ❌ Entry/TP/SL failed completely: {e}", flush=True)
+                    log.error("Entry/TP/SL failed completely: %s", e)
 
         time.sleep(POLL_INTERVAL)
 
