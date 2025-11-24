@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 SYMBOL = "XRP/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 19           # qty send in market order
+LOT_SIZE = 10           # qty send in market order
 RSI_PERIOD = 14
 RSI_LOW = 10              # reversal zone low
 RSI_HIGH = 37             # reversal zone high
