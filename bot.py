@@ -11,13 +11,13 @@ from datetime import datetime, timezone, timedelta
 SYMBOL = "XRP/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 10           # qty send in market order
+LOT_SIZE = 10             # qty send in market order
 RSI_PERIOD = 14
 RSI_LOW = 10              # reversal zone low
 RSI_HIGH = 37             # reversal zone high
 
-TP_POINTS = 0.032           # +8$ TP
-SL_POINTS = 0.016           # -4$ SL
+TP_POINTS = 0.032         # +8$ TP
+SL_POINTS = 0.016         # -4$ SL
 POLL_INTERVAL = 5         # seconds
 COOLDOWN_MINUTES = 15     # only after SL
 
@@ -84,7 +84,7 @@ def fetch_balance() -> dict:
         usdt_balance = balance['USDT']
         return {
             'free': float(usdt_balance['free']),
-            'used': float(usdt_balance['used']), 
+            'used': float(usdt_balance['used']),
             'total': float(usdt_balance['total'])
         }
     except Exception as e:
@@ -109,9 +109,12 @@ def show_balance():
         total_profit = current_balance - initial_balance
         profit_percentage = (total_profit / initial_balance) * 100 if initial_balance > 0 else 0
         
-        print(f"[{now_str()}] 💰 BALANCE: ${current_balance:.2f} | "
-              f"PROFIT: ${total_profit:+.2f} ({profit_percentage:+.2f}%) | "
-              f"USED: ${balance['used']:.2f} | FREE: ${balance['free']:.2f}", flush=True)
+        print(
+            f"[{now_str()}] 💰 BALANCE: ${current_balance:.2f} | "
+            f"PROFIT: ${total_profit:+.2f} ({profit_percentage:+.2f}%) | "
+            f"USED: ${balance['used']:.2f} | FREE: ${balance['free']:.2f}",
+            flush=True
+        )
         
         return True
     return False
@@ -153,33 +156,48 @@ def fetch_position_size() -> float:
         return 0.0
 
 def can_enter_trade() -> bool:
-    """Atomic check for trade entry conditions"""
-    global in_position, entry_in_progress, cooldown_until_utc
+    """Atomic check for trade entry conditions + DEBUG"""
+    global in_position, entry_in_progress, cooldown_until_utc, current_position
     
-    # Check if entry already in progress
+    now_utc = datetime.now(timezone.utc)
+
+    # 1) Agar entry already lock hai
     if entry_in_progress:
-        log.warning("Entry already in progress, skipping...")
+        print(f"[{now_str()}] ⛔ can_enter_trade: entry_in_progress=True, skip", flush=True)
+        log.warning("can_enter_trade blocked: entry_in_progress")
         return False
     
-    # Check cooldown
-    if cooldown_until_utc and datetime.now(timezone.utc) < cooldown_until_utc:
-        log.info("In cooldown period, skipping entry")
+    # 2) Cooldown check
+    if cooldown_until_utc and now_utc < cooldown_until_utc:
+        remaining = (cooldown_until_utc - now_utc).total_seconds() / 60
+        print(
+            f"[{now_str()}] 🧊 can_enter_trade: cooldown active, {remaining:.1f} min left",
+            flush=True
+        )
+        log.info("can_enter_trade blocked: cooldown active (%.1f min left)", remaining)
         return False
     
-    # Check bot state
+    # 3) Bot ka internal state
     if in_position:
-        log.warning("Bot thinks in position, skipping entry")
+        print(f"[{now_str()}] 🟡 can_enter_trade: in_position=True (bot state), skip entry", flush=True)
+        log.warning("can_enter_trade blocked: in_position=True (bot state)")
         return False
         
-    # Final check with exchange - ACTUAL TRUTH
+    # 4) Exchange ki REAL position
     ex_size = fetch_position_size()
     if abs(ex_size) > 1e-8:
-        log.warning("🚨 EXCHANGE SHOWS OPEN POSITION (size=%.6f), skipping entry", ex_size)
+        side = "BUY" if ex_size > 0 else "SELL"
+        print(
+            f"[{now_str()}] 🚨 can_enter_trade: exchange shows open position "
+            f"size={ex_size:.6f} side={side}, bot will sync & skip entry",
+            flush=True
+        )
+        log.warning("can_enter_trade blocked: exchange position exists size=%.6f", ex_size)
+        
         # Sync bot state with exchange
-        global current_position
         in_position = True
         current_position = {
-            "side": "BUY" if ex_size > 0 else "SELL",
+            "side": side,
             "entry": 0.0,  # Unknown entry
             "qty": abs(ex_size),
             "time": now_ist().isoformat(),
@@ -188,6 +206,7 @@ def can_enter_trade() -> bool:
         }
         return False
         
+    print(f"[{now_str()}] ✅ can_enter_trade: all clear, entry allowed", flush=True)
     return True
 
 def place_entry_with_tp_sl(side: str, approx_price: float):
@@ -256,7 +275,7 @@ def place_entry_with_tp_sl(side: str, approx_price: float):
         # Cancel TP order if SL failed
         try:
             exchange.cancel_order(tp_order.get("id"), SYMBOL)
-        except:
+        except Exception:
             pass
         raise e
 
@@ -497,20 +516,32 @@ while True:
         candle_time = int(last_closed["time"])
         next_open_price = float(curr_forming["open"])
 
+        # 🧾 DEBUG: show RSI values
+        print(
+            f"[{now_str()}] 🕯 RSI prev={prev_rsi:.2f} last={last_rsi:.2f} | "
+            f"zone=({RSI_LOW}-{RSI_HIGH})",
+            flush=True
+        )
+
         # SIGNAL GENERATION
         signal = None
         if prev_rsi < RSI_LOW and last_rsi > RSI_LOW and last_rsi < RSI_HIGH:
             signal = "BUY"
+            print(f"[{now_str()}] 📈 BUY signal detected (RSI cross up into zone)", flush=True)
         elif prev_rsi > RSI_HIGH and last_rsi < RSI_HIGH and last_rsi > RSI_LOW:
             signal = "SELL"
+            print(f"[{now_str()}] 📉 SELL signal detected (RSI cross down into zone)", flush=True)
 
         # Prevent same candle double signal
         if signal and last_entry_signal_candle == candle_time:
+            print(f"[{now_str()}] 🔁 Same candle repeat signal, ignoring...", flush=True)
             signal = None
 
         # ENTRY EXECUTION
         if signal:
-            safe_enter_trade(signal, next_open_price, candle_time)
+            ok = safe_enter_trade(signal, next_open_price, candle_time)
+            if not ok:
+                print(f"[{now_str()}] ⚠️ safe_enter_trade returned False", flush=True)
 
         time.sleep(POLL_INTERVAL)
 
