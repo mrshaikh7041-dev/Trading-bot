@@ -11,13 +11,13 @@ from datetime import datetime, timezone, timedelta
 SYMBOL = "XRP/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 10             # qty send in market order
+LOT_SIZE = 10             # qty send in market order (baki tu change kar sakta)
 RSI_PERIOD = 14
 RSI_LOW = 10              # reversal zone low
 RSI_HIGH = 37             # reversal zone high
 
-TP_POINTS = 0.032         # +8$ TP
-SL_POINTS = 0.016         # -4$ SL
+TP_POINTS = 0.032         # +TP in price
+SL_POINTS = 0.016         # -SL in price
 POLL_INTERVAL = 5         # seconds
 COOLDOWN_MINUTES = 15     # only after SL
 
@@ -54,7 +54,7 @@ exchange = ccxt.binance({
 exchange.options["adjustForTimeDifference"] = True
 exchange.load_markets()
 
-# 🆕 BALANCE TRACKING VARIABLES
+# BALANCE TRACKING VARIABLES
 initial_balance = None
 current_balance = None
 total_profit = 0.0
@@ -73,12 +73,11 @@ cooldown_until_utc = None        # SL ke baad next allowed entry time (UTC)
 entry_in_progress = False        # Entry lock to prevent double entry
 last_position_check = None       # Last position check time
 position_check_cooldown = 5      # seconds between position checks
-last_balance_check = None        # 🆕 Last balance check time
-balance_check_cooldown = 30      # 🆕 seconds between balance checks
+last_balance_check = None        # Last balance check time
+balance_check_cooldown = 30      # seconds between balance checks
 
 # ================= HELPERS =================
 def fetch_balance() -> dict:
-    """🆕 Fetch current balance from exchange"""
     try:
         balance = exchange.fetch_balance()
         usdt_balance = balance['USDT']
@@ -92,20 +91,16 @@ def fetch_balance() -> dict:
         return None
 
 def show_balance():
-    """🆕 Display current balance information"""
     global initial_balance, current_balance, total_profit
     
     balance = fetch_balance()
     if balance:
         current_balance = balance['total']
-        
-        # Set initial balance on first run
         if initial_balance is None:
             initial_balance = current_balance
             print(f"[{now_str()}] 💰 INITIAL BALANCE: ${initial_balance:.2f}", flush=True)
             log.info("Initial balance: $%.2f", initial_balance)
         
-        # Calculate profit
         total_profit = current_balance - initial_balance
         profit_percentage = (total_profit / initial_balance) * 100 if initial_balance > 0 else 0
         
@@ -115,7 +110,6 @@ def show_balance():
             f"USED: ${balance['used']:.2f} | FREE: ${balance['free']:.2f}",
             flush=True
         )
-        
         return True
     return False
 
@@ -127,18 +121,15 @@ def append_csv(row: dict):
             w.writeheader()
         w.writerow(row)
 
+# 🔁 RSI EXACTLY LIKE BACKTEST
 def rsi_wilder(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    up = delta.where(delta > 0, 0).ewm(span=period, adjust=False).mean()
+    down = -delta.where(delta < 0, 0).ewm(span=period, adjust=False).mean()
+    rsi = 100 - (100 / (1 + (up / down)))
+    return rsi
 
 def fetch_position_size() -> float:
-    """
-    MONITOR: exchange par actual position size kya hai.
-    Positive = long, negative = short.
-    """
     try:
         positions = exchange.fetch_positions([SYMBOL])
         for p in positions:
@@ -161,13 +152,11 @@ def can_enter_trade() -> bool:
     
     now_utc = datetime.now(timezone.utc)
 
-    # 1) Agar entry already lock hai
     if entry_in_progress:
         print(f"[{now_str()}] ⛔ can_enter_trade: entry_in_progress=True, skip", flush=True)
         log.warning("can_enter_trade blocked: entry_in_progress")
         return False
     
-    # 2) Cooldown check
     if cooldown_until_utc and now_utc < cooldown_until_utc:
         remaining = (cooldown_until_utc - now_utc).total_seconds() / 60
         print(
@@ -177,13 +166,11 @@ def can_enter_trade() -> bool:
         log.info("can_enter_trade blocked: cooldown active (%.1f min left)", remaining)
         return False
     
-    # 3) Bot ka internal state
     if in_position:
         print(f"[{now_str()}] 🟡 can_enter_trade: in_position=True (bot state), skip entry", flush=True)
         log.warning("can_enter_trade blocked: in_position=True (bot state)")
         return False
         
-    # 4) Exchange ki REAL position
     ex_size = fetch_position_size()
     if abs(ex_size) > 1e-8:
         side = "BUY" if ex_size > 0 else "SELL"
@@ -194,11 +181,10 @@ def can_enter_trade() -> bool:
         )
         log.warning("can_enter_trade blocked: exchange position exists size=%.6f", ex_size)
         
-        # Sync bot state with exchange
         in_position = True
         current_position = {
             "side": side,
-            "entry": 0.0,  # Unknown entry
+            "entry": 0.0,
             "qty": abs(ex_size),
             "time": now_ist().isoformat(),
             "tp_price": None,
@@ -210,13 +196,8 @@ def can_enter_trade() -> bool:
     return True
 
 def place_entry_with_tp_sl(side: str, approx_price: float):
-    """
-    1) Market entry
-    2) Ussi filled qty se TP/SL reduceOnly order place
-    """
     close_side = "sell" if side == "BUY" else "buy"
 
-    # ---- market entry ----
     params = {"reduceOnly": False}
     order = exchange.create_order(
         SYMBOL, "market", side.lower(), LOT_SIZE, None, params
@@ -230,7 +211,6 @@ def place_entry_with_tp_sl(side: str, approx_price: float):
     if qty <= 0:
         raise Exception(f"Filled qty 0, order={order}")
 
-    # ---- tp/sl prices ----
     if side == "BUY":
         tp_price = entry_price + TP_POINTS
         sl_price = entry_price - SL_POINTS
@@ -238,7 +218,6 @@ def place_entry_with_tp_sl(side: str, approx_price: float):
         tp_price = entry_price - TP_POINTS
         sl_price = entry_price + SL_POINTS
 
-    # ---- TP (limit reduceOnly) ----
     try:
         tp_order = exchange.create_order(
             SYMBOL,
@@ -256,7 +235,6 @@ def place_entry_with_tp_sl(side: str, approx_price: float):
         log.error("TP order failed: %s", e)
         raise e
 
-    # ---- SL (stop_market reduceOnly) ----
     try:
         sl_order = exchange.create_order(
             SYMBOL,
@@ -272,7 +250,6 @@ def place_entry_with_tp_sl(side: str, approx_price: float):
         log.info("Placed SL id=%s price=%.4f", sl_order.get("id"), sl_price)
     except Exception as e:
         log.error("SL order failed: %s", e)
-        # Cancel TP order if SL failed
         try:
             exchange.cancel_order(tp_order.get("id"), SYMBOL)
         except Exception:
@@ -282,24 +259,20 @@ def place_entry_with_tp_sl(side: str, approx_price: float):
     return entry_price, qty, tp_price, sl_price
 
 def safe_enter_trade(signal: str, next_open_price: float, candle_time: int):
-    """Safe entry with proper locking"""
     global in_position, current_position, entry_in_progress, last_entry_signal_candle
     
-    entry_in_progress = True  # Lock entry
+    entry_in_progress = True
     try:
         print(f"[{now_str()}] 🔍 Checking entry conditions for {signal}...", flush=True)
         
-        # Final atomic check
         if not can_enter_trade():
             print(f"[{now_str()}] ❌ Entry conditions not met, skipping", flush=True)
             return False
             
         print(f"[{now_str()}] 🚀 ENTERING {signal} | Price ~ {next_open_price:.4f}", flush=True)
         
-        # Place entry with TP/SL
         entry_price, qty, tp_price, sl_price = place_entry_with_tp_sl(signal, next_open_price)
 
-        # Update state after successful entry
         current_position = {
             "side": signal,
             "entry": entry_price,
@@ -326,12 +299,10 @@ def safe_enter_trade(signal: str, next_open_price: float, candle_time: int):
         log.error("Entry failed: %s", e)
         print(f"[{now_str()}] ❌ Entry failed: {e}", flush=True)
         
-        # Check if position was partially opened
-        time.sleep(1)  # Wait for exchange to update
+        time.sleep(1)
         size_after_fail = fetch_position_size()
         if abs(size_after_fail) > 1e-8:
             print(f"[{now_str()}] ⚠️ Partial entry detected (size={size_after_fail:.6f})", flush=True)
-            # Entry ho chuki hai, TP/SL fail hua
             in_position = True
             try:
                 t = exchange.fetch_ticker(SYMBOL)
@@ -357,21 +328,19 @@ def safe_enter_trade(signal: str, next_open_price: float, candle_time: int):
             )
         return False
     finally:
-        entry_in_progress = False  # Release lock
+        entry_in_progress = False
 
 def sync_with_exchange():
-    """Sync bot state with exchange reality"""
     global in_position, current_position
     
     ex_size = fetch_position_size()
     
     if abs(ex_size) > 1e-8 and not in_position:
-        # Exchange has position but bot doesn't know
         print(f"[{now_str()}] 🔄 Syncing: Exchange has position (size={ex_size:.6f})", flush=True)
         in_position = True
         current_position = {
             "side": "BUY" if ex_size > 0 else "SELL",
-            "entry": 0.0,  # Unknown
+            "entry": 0.0,
             "qty": abs(ex_size),
             "time": now_ist().isoformat(),
             "tp_price": None,
@@ -380,14 +349,12 @@ def sync_with_exchange():
         log.info("Synced with exchange: position exists (size=%.6f)", ex_size)
     
     elif abs(ex_size) < 1e-8 and in_position:
-        # Bot thinks in position but exchange doesn't
         print(f"[{now_str()}] 🔄 Syncing: No position on exchange", flush=True)
         in_position = False
         current_position = None
         log.info("Synced with exchange: no position")
 
 def check_balance_periodically():
-    """🆕 Check and display balance periodically"""
     global last_balance_check
     
     current_time = datetime.now(timezone.utc)
@@ -396,13 +363,11 @@ def check_balance_periodically():
             last_balance_check = current_time
 
 def check_position_closed():
-    """Monitor position closure"""
     global in_position, current_position, cooldown_until_utc, last_position_check
 
     if not in_position or current_position is None:
         return
 
-    # Rate limit position checks
     current_time = datetime.now(timezone.utc)
     if last_position_check and (current_time - last_position_check).total_seconds() < position_check_cooldown:
         return
@@ -411,10 +376,8 @@ def check_position_closed():
 
     size = fetch_position_size()
     if abs(size) > 1e-8:
-        # still open
         return
 
-    # Position closed
     try:
         ticker = exchange.fetch_ticker(SYMBOL)
         exit_price = float(ticker.get("last") or ticker.get("close"))
@@ -429,7 +392,7 @@ def check_position_closed():
 
     pnl = (exit_price - entry) * qty if side == "BUY" else (entry - exit_price) * qty
 
-    reason = "MANUAL"  # Default to manual
+    reason = "MANUAL"
     if tp_price is not None and sl_price is not None:
         dist_tp = abs(exit_price - tp_price)
         dist_sl = abs(exit_price - sl_price)
@@ -465,14 +428,12 @@ print(f"[{now_str()}] 🚀 RSI REVERSAL BOT STARTING...", flush=True)
 print(f"[{now_str()}] ⚙️  Config: RSI({RSI_LOW}-{RSI_HIGH}) | TP: {TP_POINTS} | SL: {SL_POINTS}", flush=True)
 log.info("Bot started for %s", SYMBOL)
 
-# 🆕 SHOW INITIAL BALANCE ON STARTUP
 print(f"[{now_str()}] 🔄 Connecting to exchange...", flush=True)
 if show_balance():
     print(f"[{now_str()}] ✅ Connected successfully!", flush=True)
 else:
     print(f"[{now_str()}] ❌ Failed to fetch initial balance", flush=True)
 
-# Initial sync with exchange
 print(f"[{now_str()}] 🔄 Initial sync with exchange...", flush=True)
 sync_with_exchange()
 
@@ -480,24 +441,18 @@ while True:
     try:
         now_utc = datetime.now(timezone.utc)
 
-        # 🆕 CHECK BALANCE PERIODICALLY
         check_balance_periodically()
-
-        # SYNC WITH EXCHANGE FIRST
         sync_with_exchange()
 
-        # If in position, only monitor - NO NEW ENTRIES
         if in_position:
             check_position_closed()
             time.sleep(POLL_INTERVAL)
             continue
 
-        # COOLDOWN CHECK
         if cooldown_until_utc and now_utc < cooldown_until_utc:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # FETCH CANDLES FOR SIGNAL
         ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=RSI_PERIOD + 5)
         df = pd.DataFrame(ohlc, columns=["time", "open", "high", "low", "close", "volume"])
         df["rsi"] = rsi_wilder(df["close"], RSI_PERIOD)
@@ -506,38 +461,42 @@ while True:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # GET CANDLE DATA
-        prev_row = df.iloc[-3]
-        last_closed = df.iloc[-2]
-        curr_forming = df.iloc[-1]
+        # EXACT BACKTEST-STYLE INDEXING:
+        # prev = i-1, closed = i, next entry candle = i+1
+        prev_row = df.iloc[-3]       # i-1
+        last_closed = df.iloc[-2]    # i
+        curr_forming = df.iloc[-1]   # i+1 (entry candle)
 
         prev_rsi = float(prev_row["rsi"])
         last_rsi = float(last_closed["rsi"])
         candle_time = int(last_closed["time"])
         next_open_price = float(curr_forming["open"])
 
-        # 🧾 DEBUG: show RSI values
         print(
             f"[{now_str()}] 🕯 RSI prev={prev_rsi:.2f} last={last_rsi:.2f} | "
             f"zone=({RSI_LOW}-{RSI_HIGH})",
             flush=True
         )
 
-        # SIGNAL GENERATION
+        # -------- BACKTEST STRATEGY (COPIED) --------
         signal = None
-        if prev_rsi < RSI_LOW and last_rsi > RSI_LOW and last_rsi < RSI_HIGH:
+
+        # BUY: previous RSI below low, current closed RSI enters (low, high)
+        if prev_rsi < RSI_LOW and (RSI_LOW < last_rsi < RSI_HIGH):
             signal = "BUY"
-            print(f"[{now_str()}] 📈 BUY signal detected (RSI cross up into zone)", flush=True)
-        elif prev_rsi > RSI_HIGH and last_rsi < RSI_HIGH and last_rsi > RSI_LOW:
+            print(f"[{now_str()}] 📈 BUY signal (cross up into zone)", flush=True)
+
+        # SELL: previous RSI above high, current closed RSI enters (low, high)
+        elif prev_rsi > RSI_HIGH and (RSI_LOW < last_rsi < RSI_HIGH):
             signal = "SELL"
-            print(f"[{now_str()}] 📉 SELL signal detected (RSI cross down into zone)", flush=True)
+            print(f"[{now_str()}] 📉 SELL signal (cross down into zone)", flush=True)
 
-        # Prevent same candle double signal
+        # same-candle double entry avoid
         if signal and last_entry_signal_candle == candle_time:
-            print(f"[{now_str()}] 🔁 Same candle repeat signal, ignoring...", flush=True)
+            print(f"[{now_str()}] 🔁 Same candle repeat signal ignored", flush=True)
             signal = None
+        # --------------------------------------------
 
-        # ENTRY EXECUTION
         if signal:
             ok = safe_enter_trade(signal, next_open_price, candle_time)
             if not ok:
@@ -546,7 +505,6 @@ while True:
         time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
-        # 🆕 SHOW FINAL BALANCE ON EXIT
         print(f"[{now_str()}] ⛔ Bot stopping...", flush=True)
         show_balance()
         print(f"[{now_str()}] 👋 Bot stopped by user", flush=True)
