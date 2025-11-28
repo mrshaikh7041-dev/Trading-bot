@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 SYMBOL = "XRP/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 10             # qty send in market order (baki tu change kar sakta)
+LOT_SIZE = 10             # qty send in market order
 RSI_PERIOD = 14
 RSI_LOW = 10              # reversal zone low
 RSI_HIGH = 37             # reversal zone high
@@ -147,16 +147,12 @@ def fetch_position_size() -> float:
         return 0.0
 
 def can_enter_trade() -> bool:
-    """Atomic check for trade entry conditions + DEBUG"""
-    global in_position, entry_in_progress, cooldown_until_utc, current_position
+    """Atomic check for trade entry conditions (no entry_in_progress check now)"""
+    global in_position, cooldown_until_utc, current_position
     
     now_utc = datetime.now(timezone.utc)
 
-    if entry_in_progress:
-        print(f"[{now_str()}] ⛔ can_enter_trade: entry_in_progress=True, skip", flush=True)
-        log.warning("can_enter_trade blocked: entry_in_progress")
-        return False
-    
+    # Cooldown
     if cooldown_until_utc and now_utc < cooldown_until_utc:
         remaining = (cooldown_until_utc - now_utc).total_seconds() / 60
         print(
@@ -166,11 +162,13 @@ def can_enter_trade() -> bool:
         log.info("can_enter_trade blocked: cooldown active (%.1f min left)", remaining)
         return False
     
+    # Bot state
     if in_position:
         print(f"[{now_str()}] 🟡 can_enter_trade: in_position=True (bot state), skip entry", flush=True)
         log.warning("can_enter_trade blocked: in_position=True (bot state)")
         return False
         
+    # Exchange reality
     ex_size = fetch_position_size()
     if abs(ex_size) > 1e-8:
         side = "BUY" if ex_size > 0 else "SELL"
@@ -261,14 +259,15 @@ def place_entry_with_tp_sl(side: str, approx_price: float):
 def safe_enter_trade(signal: str, next_open_price: float, candle_time: int):
     global in_position, current_position, entry_in_progress, last_entry_signal_candle
     
+    print(f"[{now_str()}] 🔍 Checking entry conditions for {signal}...", flush=True)
+
+    # PEHLE check, phir lock
+    if not can_enter_trade():
+        print(f"[{now_str()}] ❌ Entry conditions not met, skipping", flush=True)
+        return False
+
     entry_in_progress = True
     try:
-        print(f"[{now_str()}] 🔍 Checking entry conditions for {signal}...", flush=True)
-        
-        if not can_enter_trade():
-            print(f"[{now_str()}] ❌ Entry conditions not met, skipping", flush=True)
-            return False
-            
         print(f"[{now_str()}] 🚀 ENTERING {signal} | Price ~ {next_open_price:.4f}", flush=True)
         
         entry_price, qty, tp_price, sl_price = place_entry_with_tp_sl(signal, next_open_price)
@@ -461,7 +460,6 @@ while True:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # EXACT BACKTEST-STYLE INDEXING:
         # prev = i-1, closed = i, next entry candle = i+1
         prev_row = df.iloc[-3]       # i-1
         last_closed = df.iloc[-2]    # i
