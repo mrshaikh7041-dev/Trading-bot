@@ -76,6 +76,9 @@ position_check_cooldown = 5      # seconds between position checks
 last_balance_check = None        # Last balance check time
 balance_check_cooldown = 30      # seconds between balance checks
 
+# 🆕: trade close ke baad RSI ko zone se bahar aane ka wait
+wait_for_zone_exit = False
+
 # ================= HELPERS =================
 def fetch_balance() -> dict:
     try:
@@ -147,7 +150,7 @@ def fetch_position_size() -> float:
         return 0.0
 
 def can_enter_trade() -> bool:
-    """Atomic check for trade entry conditions (no entry_in_progress check now)"""
+    """Atomic check for trade entry conditions (no entry_in_progress check)"""
     global in_position, cooldown_until_utc, current_position
     
     now_utc = datetime.now(timezone.utc)
@@ -362,7 +365,7 @@ def check_balance_periodically():
             last_balance_check = current_time
 
 def check_position_closed():
-    global in_position, current_position, cooldown_until_utc, last_position_check
+    global in_position, current_position, cooldown_until_utc, last_position_check, wait_for_zone_exit
 
     if not in_position or current_position is None:
         return
@@ -399,6 +402,11 @@ def check_position_closed():
             reason = "SL"
         else:
             reason = "TP"
+
+    # 🆕: TP (ya koi bhi auto exit) ke baad pehle RSI ko zone se bahar aane ka wait
+    if reason != "SL":   # SL pe to waise bhi time-based cooldown hai
+        wait_for_zone_exit = True
+        print(f"[{now_str()}] 🧺 Trade closed with {reason}, waiting for RSI to exit zone before next entry", flush=True)
 
     if reason == "SL":
         cooldown_until_utc = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
@@ -475,6 +483,17 @@ while True:
             f"zone=({RSI_LOW}-{RSI_HIGH})",
             flush=True
         )
+
+        # 🆕: agar previous trade ke baad abhi tak RSI zone se bahar hi nahi gaya,
+        # aur abhi bhi zone ke andar hai, to naya signal ignore
+        if wait_for_zone_exit and (RSI_LOW < last_rsi < RSI_HIGH):
+            print(f"[{now_str()}] 🚫 Still inside zone after last trade - waiting for RSI to exit", flush=True)
+            time.sleep(POLL_INTERVAL)
+            continue
+        # agar ab RSI zone se bahar chala gaya, to flag reset
+        if wait_for_zone_exit and (last_rsi <= RSI_LOW or last_rsi >= RSI_HIGH):
+            wait_for_zone_exit = False
+            print(f"[{now_str()}] ✅ RSI exited zone, new entries allowed", flush=True)
 
         # -------- BACKTEST STRATEGY (COPIED) --------
         signal = None
