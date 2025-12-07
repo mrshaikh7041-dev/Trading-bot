@@ -8,16 +8,16 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 # ========== USER CONFIG ==========
-SYMBOL = "XRP/USDT"
+SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 10
+LOT_SIZE = 0.05
 RSI_PERIOD = 14
 RSI_LOW = 10
 RSI_HIGH = 37
 
-TP_POINTS = 0.032
-SL_POINTS = 0.016
+TP_POINTS = 8
+SL_POINTS = 4
 POLL_INTERVAL = 5
 COOLDOWN_MINUTES = 15
 
