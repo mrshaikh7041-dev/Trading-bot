@@ -24,8 +24,8 @@ SL_POINTS = 0.016
 POLL_INTERVAL = 5
 COOLDOWN_MINUTES = 15
 
-EMA_FAST = 50
-EMA_SLOW = 200
+EMA_FAST = 13
+EMA_SLOW = 34
 
 LOG_FILE = "/home/ubuntu/Trading-bot/bot.log"
 CSV_FILE = f"{SYMBOL.replace('/', '-')}_trades.csv"
