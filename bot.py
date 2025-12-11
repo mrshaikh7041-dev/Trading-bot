@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
+"""
+Fixed RSI+EMA scalper bot for Binance USDT-M futures
+Settings confirmed by user:
+ - SYMBOL = "XRP/USDT"
+ - EMA_FAST = 13, EMA_SLOW = 34
+ - RSI_PERIOD = 14, RSI_LOW = 10, RSI_HIGH = 37
+ - LOT_SIZE = 10
+ - TP_POINTS = 0.032, SL_POINTS = 0.016
+This includes defensive parsing, stop-market SL using closePosition=True, and debug prints.
+"""
 import ccxt
 import pandas as pd
 import time
 import csv
 import os
 import logging
-import traceback
 from datetime import datetime, timezone, timedelta
 
-# ========== CONFIG ==========
-DEBUG = True
-
+# ========== USER CONFIG ==========
 SYMBOL = "XRP/USDT"
 TIMEFRAME = "1m"
 
@@ -43,16 +50,10 @@ log = logging.getLogger(__name__)
 
 # ========== TIME HELPERS ==========
 IST = timezone(timedelta(hours=5, minutes=30))
-
 def now_ist():
     return datetime.now(timezone.utc).astimezone(IST)
-
 def now_str():
     return now_ist().strftime("%Y-%m-%d %H:%M:%S %Z")
-
-def dbg(*args, **kwargs):
-    if DEBUG:
-        print(*args, **kwargs, flush=True)
 
 # ========== EXCHANGE ==========
 exchange = ccxt.binance({
@@ -63,23 +64,23 @@ exchange = ccxt.binance({
 })
 exchange.options["adjustForTimeDifference"] = True
 
+# load markets once
 try:
     exchange.load_markets()
 except Exception as e:
     print(f"[{now_str()}] ⚠️ load_markets failed: {e}")
-    traceback.print_exc()
 
 FUT_SYMBOL = SYMBOL.replace("/", "")
 
 try:
+    # set leverage, ignore error if fails
     exchange.set_leverage(75, SYMBOL)
 except Exception as e:
     log.warning("set_leverage failed: %s", e)
-    dbg(f"[{now_str()}] set_leverage warning: {e}")
 
 # ========== STATE ==========
 in_position = False
-current_position = None
+current_position = None           # {"side","entry","time"}
 cooldown_until_utc = None
 wait_for_zone_exit = False
 
@@ -88,282 +89,277 @@ balance_check_interval = 30
 
 initial_balance = None
 current_balance = None
-total_profit = 0.0
 
 # ========== HELPERS ==========
-def safe_fetch_balance_raw():
-    """Return raw fetch_balance result or None"""
+def safe_get(d, *keys, default=None):
+    """Helper to safely traverse nested dicts/lists."""
     try:
-        return exchange.fetch_balance()
-    except Exception as e:
-        log.error("fetch_balance error: %s", e)
-        if DEBUG:
-            traceback.print_exc()
-        return None
+        x = d
+        for k in keys:
+            x = x[k]
+        return x
+    except Exception:
+        return default
 
 def fetch_balance_usdt():
-    b = safe_fetch_balance_raw()
-    if not b:
-        return None
-    # Some exchanges return top-level keys, some return 'USDT' dict; be defensive
+    """Return dict or None"""
     try:
-        if "USDT" in b:
-            usdt = b["USDT"]
-            return {
-                "free": float(usdt.get("free", 0)),
-                "used": float(usdt.get("used", 0)),
-                "total": float(usdt.get("total", 0))
-            }
-        # some CCXT builds put balances under b['info']['assets'] etc — try safe fallbacks
-        info = b.get("info", {}) if isinstance(b, dict) else {}
-        # try to find USDT in info.positions? fallback to totalValue if present
-        # best-effort: look for total or equity fields
-        if isinstance(b, dict) and "total" in b:
-            total = float(b.get("total", 0))
-            free = float(b.get("free", 0)) if "free" in b else total
-            used = float(b.get("used", 0)) if "used" in b else 0.0
-            return {"free": free, "used": used, "total": total}
-        return None
+        bal = exchange.fetch_balance()
+        # ccxt sometimes returns top-level 'USDT' or inside 'total'
+        usdt = bal.get("USDT") or safe_get(bal, "total") and {"free": safe_get(bal, "free", default=0), "used": safe_get(bal, "used", default=0), "total": safe_get(bal, "total", default=0)}
+        if not usdt:
+            # try 'info' paths (Binance returns 'total' inside)
+            info = bal.get("info", {})
+            # many shapes exist: check balances list
+            return None
+        return {
+            "free": float(usdt.get("free", 0)),
+            "used": float(usdt.get("used", 0)),
+            "total": float(usdt.get("total", usdt.get("free", 0) + usdt.get("used", 0)))
+        }
     except Exception as e:
-        log.error("parse balance error: %s", e)
-        if DEBUG:
-            traceback.print_exc()
+        log.error("fetch_balance_usdt error: %s", e)
         return None
 
 def show_balance():
-    global initial_balance, current_balance, total_profit
+    global initial_balance, current_balance
     b = fetch_balance_usdt()
     if not b:
-        dbg(f"[{now_str()}] ⚠️ Unable to fetch balance (None).")
+        print(f"[{now_str()}] ⚠️ BALANCE: unable to fetch", flush=True)
         return
     current_balance = b["total"]
     if initial_balance is None:
         initial_balance = current_balance
-    total_profit = current_balance - initial_balance
-    pct = (total_profit / initial_balance) * 100 if initial_balance else 0.0
-    print(f"[{now_str()}] 💰 BAL: ${current_balance:.2f} | PNL: ${total_profit:+.2f} ({pct:+.2f}%)", flush=True)
+    pnl = current_balance - initial_balance
+    pct = (pnl / initial_balance * 100) if initial_balance else 0.0
+    print(f"[{now_str()}] 💰 BAL: ${current_balance:.2f} | PNL: {pnl:+.2f}$ ({pct:+.2f}%)", flush=True)
 
 def append_csv(row: dict):
-    try:
-        exists = os.path.isfile(CSV_FILE)
-        with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=row.keys())
-            if not exists:
-                w.writeheader()
-            w.writerow(row)
-    except Exception as e:
-        log.error("append_csv error: %s", e)
-        if DEBUG:
-            traceback.print_exc()
+    exists = os.path.isfile(CSV_FILE)
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=row.keys())
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
 
-def rsi_wilder(series, period=14):
+# ========== INDICATORS ==========
+def rsi_wilder(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    up = delta.where(delta > 0, 0).ewm(span=period, adjust=False).mean()
-    down = (-delta.where(delta < 0, 0)).ewm(span=period, adjust=False).mean()
-    # avoid division by zero
-    with pd.option_context('mode.use_inf_as_na', True):
-        rs = up / down.replace({0: pd.NA})
-        rs = rs.fillna(0)
-    return 100 - (100 / (1 + (up / down.replace({0: pd.NA})).fillna(0)))
+    up = delta.where(delta > 0, 0).ewm(alpha=1/period, adjust=False).mean()
+    down = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / down.replace(0, 1e-10)
+    return 100 - (100 / (1 + rs))
 
-def fetch_position_size():
-    """Return current positionAmt as float. Safe for different response shapes."""
-    try:
-        bal = safe_fetch_balance_raw()
-        if not bal:
-            return 0.0
-        info = bal.get("info") if isinstance(bal, dict) else None
-        # Newer CCXT returns dictionary with 'positions' inside info
-        positions = []
-        if info and isinstance(info, dict):
-            positions = info.get("positions") or info.get("assets") or []
-        # also some versions place positions directly under bal.get('positions')
-        if not positions:
-            positions = bal.get("positions") or []
-        for p in positions:
-            # positions may be dict-like with 'symbol' key (e.g., 'XRPUSDT')
-            symbol_key = p.get("symbol") if isinstance(p, dict) else None
-            if symbol_key and symbol_key.upper() == FUT_SYMBOL.upper():
-                amt = p.get("positionAmt") or p.get("positionAmt")
-                try:
-                    return float(amt)
-                except:
-                    return 0.0
-        return 0.0
-    except Exception as e:
-        log.error("fetch_position_size error: %s", e)
-        if DEBUG:
-            traceback.print_exc()
-        return 0.0
-
-# EMA CALC
-def ema(series, period):
+def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
-# ========== TRADING HELPERS ==========
-def can_enter_trade():
-    global in_position, cooldown_until_utc, current_position
-    now_utc = datetime.now(timezone.utc)
-
-    if cooldown_until_utc and now_utc < cooldown_until_utc:
-        remaining = (cooldown_until_utc - now_utc).total_seconds() / 60
-        dbg(f"[{now_str()}] 🧊 Cooldown active: {remaining:.1f} min left")
-        return False
-
-    ex_size = fetch_position_size()
-    dbg(f"[{now_str()}] 🔁 Exchange reported position size: {ex_size}")
-
-    if abs(ex_size) > 1e-8:
-        # sync bot state to exchange
-        in_position = True
-        side = "BUY" if ex_size > 0 else "SELL"
-        if current_position is None:
-            current_position = {"side": side, "entry": 0.0}
-            dbg(f"[{now_str()}] ⚠️ Bot synced: detected existing position on exchange -> {ex_size} ({side})")
-        return False
-
-    # if bot thinks it's in position but exchange reports zero => reset
-    if in_position and abs(ex_size) < 1e-8:
-        dbg(f"[{now_str()}] 🔄 Sync: bot was in_position but exchange size 0 -> reset")
-        in_position = False
-        current_position = None
-
-    return not in_position
-
-def place_entry_with_tp_sl(side, approx_price):
-    close_side = "sell" if side == "BUY" else "buy"
+# ========== POSITION INFO ==========
+def fetch_position_size():
+    """Return positionAmt as float (contracts). Defensive parsing."""
     try:
-        dbg(f"[{now_str()}] 📝 Creating market order {side} size={LOT_SIZE}")
-        order = exchange.create_order(SYMBOL, "market", side.lower(), LOT_SIZE)
-        dbg(f"[{now_str()}] ↪ market order response: {order}")
+        bal = exchange.fetch_balance()
+        info = bal.get("info", {})
+        positions = info.get("positions") or []
+        for p in positions:
+            # symbol format might be 'XRPUSDT' vs FUT_SYMBOL
+            if p.get("symbol") == FUT_SYMBOL:
+                return float(p.get("positionAmt", 0) or 0)
     except Exception as e:
-        log.error("create market order failed: %s", e)
-        if DEBUG:
-            traceback.print_exc()
-        raise
+        log.error("fetch_position_size error: %s", e)
+    return 0.0
 
-    # entry price: try average, fallback to filledPrice fields or approx_price
-    entry_price = approx_price
+# ========== ORDER HELPERS ==========
+def cancel_all_open_orders():
     try:
-        if isinstance(order, dict):
-            entry_price = float(order.get("average") or order.get("price") or approx_price)
-        else:
-            entry_price = float(approx_price)
-    except Exception:
-        entry_price = approx_price
+        orders = exchange.fetch_open_orders(SYMBOL)
+        for o in orders:
+            try:
+                exchange.cancel_order(o["id"], SYMBOL)
+                print(f"[{now_str()}] ❌ Cancelled order {o.get('id')}", flush=True)
+            except Exception as e:
+                print(f"[{now_str()}] ⚠️ Cancel order {o.get('id')} failed: {e}", flush=True)
+    except Exception as e:
+        log.error("fetch_open_orders error: %s", e)
 
-    # compute tp/sl based on side
+def create_market_entry(side, amount):
+    """Place market entry and return entry price (float) or None"""
+    try:
+        order = exchange.create_order(SYMBOL, "market", side.lower(), amount)
+        # ccxt returns different keys: 'average' or 'fills' or 'info'
+        avg = order.get("average")
+        if avg is None:
+            # try info
+            info = order.get("info") or {}
+            # some exchanges return 'fills' array with price
+            fills = info.get("fills") or []
+            if fills and isinstance(fills, list) and len(fills) > 0:
+                try:
+                    avg = float(fills[0].get("price"))
+                except Exception:
+                    pass
+            avg = avg or safe_get(info, "avgPrice") or safe_get(info, "averagePrice")
+        if avg is None:
+            # fallback: fetch ticker last
+            tick = exchange.fetch_ticker(SYMBOL)
+            avg = float(tick.get("last") or tick.get("close"))
+        return float(avg)
+    except Exception as e:
+        print(f"[{now_str()}] ❌ Market entry failed: {e}", flush=True)
+        log.error("market entry failed: %s", e)
+        return None
+
+def place_tp_and_sl(side, amount, entry_price):
+    """Place TP limit (reduceOnly) and SL stop_market (closePosition True)."""
+    close_side = "sell" if side == "BUY" else "buy"
+    # compute prices
     if side == "BUY":
-        tp = entry_price + TP_POINTS
-        sl = entry_price - SL_POINTS
+        tp_price = entry_price + TP_POINTS
+        sl_price = entry_price - SL_POINTS
     else:
-        tp = entry_price - TP_POINTS
-        sl = entry_price + SL_POINTS
+        tp_price = entry_price - TP_POINTS
+        sl_price = entry_price + SL_POINTS
 
-    # place TP (limit reduceOnly)
+    tp_ok = False
+    sl_ok = False
+
+    # TP as limit reduceOnly
     try:
-        tp_order = exchange.create_order(
-            SYMBOL, "limit", close_side, LOT_SIZE, tp,
+        resp_tp = exchange.create_order(
+            SYMBOL, "limit", close_side, amount, tp_price,
             {"reduceOnly": True, "timeInForce": "GTC"}
         )
-        dbg(f"[{now_str()}] ↪ TP order response: {tp_order}")
+        tp_ok = True
+        print(f"[{now_str()}] ✅ TP placed {tp_price:.4f} (order id: {safe_get(resp_tp,'id')})", flush=True)
     except Exception as e:
-        log.error("create TP order failed: %s", e)
-        if DEBUG:
-            traceback.print_exc()
+        print(f"[{now_str()}] ⚠️ TP place failed: {e}", flush=True)
+        log.error("TP placement failed: %s", e)
 
-    # place SL (stop_market reduceOnly)
+    # SL as stop_market with closePosition=True
+    # For Binance USDT-M v2, param 'stopPrice' and 'closePosition': True is supported
     try:
-        sl_order = exchange.create_order(
-            SYMBOL, "stop_market", close_side, LOT_SIZE, None,
-            {"stopPrice": sl, "reduceOnly": True}
+        resp_sl = exchange.create_order(
+            SYMBOL, "stop_market", close_side, amount, None,
+            {"stopPrice": sl_price, "reduceOnly": True, "closePosition": True}
         )
-        dbg(f"[{now_str()}] ↪ SL order response: {sl_order}")
+        sl_ok = True
+        print(f"[{now_str()}] ✅ SL placed stopPrice={sl_price:.4f} (order id: {safe_get(resp_sl,'id')})", flush=True)
     except Exception as e:
-        log.error("create SL order failed: %s", e)
-        if DEBUG:
-            traceback.print_exc()
+        # try fallback: stop_market with workingType 'MARK_PRICE' or 'TP/SL' variant
+        print(f"[{now_str()}] ⚠️ SL place failed (first try): {e}", flush=True)
+        log.warning("SL place failed first try: %s", e)
+        try:
+            resp_sl = exchange.create_order(
+                SYMBOL, "stop_market", close_side, amount, None,
+                {"stopPrice": sl_price, "reduceOnly": True}
+            )
+            sl_ok = True
+            print(f"[{now_str()}] ✅ SL placed fallback stopPrice={sl_price:.4f}", flush=True)
+        except Exception as e2:
+            print(f"[{now_str()}] ❌ SL place failed fallback: {e2}", flush=True)
+            log.error("SL placement completely failed: %s", e2)
 
-    # finally return entry,tp,sl
-    return entry_price, tp, sl
+    return tp_ok, sl_ok, tp_price, sl_price
 
-def safe_enter_trade(signal, next_open_price):
-    global in_position, current_position
-    dbg(f"[{now_str()}] 🔍 Checking entry for {signal}")
-    if not can_enter_trade():
-        dbg(f"[{now_str()}] ❌ Entry blocked by can_enter_trade")
+# ========== ENTRY ROUTINE ==========
+def safe_enter_trade(signal: str, next_open_price: float):
+    global in_position, current_position, cooldown_until_utc
+
+    print(f"[{now_str()}] 🔍 Trying entry: {signal}", flush=True)
+
+    # cooldown check
+    now_utc = datetime.now(timezone.utc)
+    if cooldown_until_utc and now_utc < cooldown_until_utc:
+        print(f"[{now_str()}] 🧊 Cooldown active, blocked entry", flush=True)
         return
-    try:
-        entry, tp, sl = place_entry_with_tp_sl(signal, next_open_price)
+
+    # ensure exchange has no position
+    ex_size = fetch_position_size()
+    if abs(ex_size) > 1e-8:
+        print(f"[{now_str()}] 🔄 Exchange still has position ({ex_size}), skipping entry", flush=True)
         in_position = True
-        current_position = {"side": signal, "entry": entry}
-        print(f"[{now_str()}] 🚀 ENTER {signal} @ {entry:.4f} | TP {tp:.4f} SL {sl:.4f}")
-        log.info("Entered %s @ %.4f", signal, entry)
-    except Exception as e:
-        print(f"[{now_str()}] ❌ Entry failed: {e}")
-        if DEBUG:
-            traceback.print_exc()
-
-def on_position_closed(exit_price):
-    global in_position, current_position, wait_for_zone_exit, cooldown_until_utc
-    if current_position is None:
-        dbg(f"[{now_str()}] ⚠️ on_position_closed called but current_position is None")
         return
-    side = current_position.get("side")
-    entry = float(current_position.get("entry", 0.0))
-    pnl = (exit_price - entry) * LOT_SIZE if side == "BUY" else (entry - exit_price) * LOT_SIZE
 
-    append_csv({
+    # create market entry
+    entry_price = create_market_entry(signal, LOT_SIZE)
+    if entry_price is None:
+        print(f"[{now_str()}] ❌ Entry aborted (no entry price)", flush=True)
+        return
+
+    # place TP and SL
+    tp_ok, sl_ok, tp_price, sl_price = place_tp_and_sl(signal, LOT_SIZE, entry_price)
+
+    # if SL placement failed we should cancel entry (or close position) - BE CAREFUL
+    if not sl_ok:
+        print(f"[{now_str()}] ⚠️ SL not placed! Attempting to close immediate to avoid unprotected position.", flush=True)
+        try:
+            # close the position immediately (market opposite)
+            close_side = "sell" if signal == "BUY" else "buy"
+            exchange.create_order(SYMBOL, "market", close_side, LOT_SIZE)
+            print(f"[{now_str()}] ❌ Forced close executed due to missing SL", flush=True)
+        except Exception as e:
+            print(f"[{now_str()}] ❌ Forced close failed: {e}", flush=True)
+        return
+
+    # success - update bot state
+    in_position = True
+    current_position = {"side": signal, "entry": entry_price, "tp": tp_price, "sl": sl_price, "time": now_str()}
+    print(f"[{now_str()}] 🚀 ENTERED {signal} @ {entry_price:.4f} | TP {tp_price:.4f} SL {sl_price:.4f}", flush=True)
+    log.info("ENTER %s @ %.4f TP %.4f SL %.4f", signal, entry_price, tp_price, sl_price)
+
+# ========== EXIT HANDLER ==========
+def on_position_closed(exit_price: float):
+    global in_position, current_position, cooldown_until_utc, wait_for_zone_exit
+    if current_position is None:
+        print(f"[{now_str()}] ⚠️ on_position_closed called but current_position None", flush=True)
+        return
+
+    side = current_position.get("side")
+    entry = float(current_position.get("entry"))
+    pnl = (exit_price - entry) * LOT_SIZE if side == "BUY" else (entry - exit_price) * LOT_SIZE
+    row = {
         "time": now_str(),
         "side": side,
         "entry": entry,
         "exit": exit_price,
         "pnl": round(pnl, 6)
-    })
+    }
+    append_csv(row)
+    print(f"[{now_str()}] 📊 EXIT {side} @ {exit_price:.4f} | PNL={pnl:.4f}", flush=True)
+    log.info("EXIT %s @ %.4f PNL %.4f", side, exit_price, pnl)
 
-    # set wait flag
-    wait_for_zone_exit = True
+    # cancel any leftover orders
+    cancel_all_open_orders()
 
-    # cancel leftover orders if any
-    try:
-        open_orders = exchange.fetch_open_orders(SYMBOL) or []
-        dbg(f"[{now_str()}] 🔎 open_orders before cancel: {open_orders}")
-        for o in open_orders:
-            try:
-                exchange.cancel_order(o.get("id"), SYMBOL)
-                dbg(f"[{now_str()}] ❌ Cancelled leftover order {o.get('id')}")
-            except Exception as e:
-                dbg(f"[{now_str()}] ⚠️ Cancel failed for {o.get('id')}: {e}")
-    except Exception as e:
-        log.error("fetch_open_orders/cancel error: %s", e)
-        if DEBUG:
-            traceback.print_exc()
-
-    print(f"[{now_str()}] 📊 EXIT {side} @ {exit_price:.4f} | PNL={pnl:.4f}")
-    in_position = False
-    current_position = None
-    # impose cooldown after losing trade
+    # if loss then cooldown
     if pnl < 0:
         cooldown_until_utc = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
-        dbg(f"[{now_str()}] 🧊 Loss cooldown set until {cooldown_until_utc.isoformat()}")
+        print(f"[{now_str()}] 🧊 Loss cooldown set for {COOLDOWN_MINUTES} minutes", flush=True)
+    else:
+        # set RSI zone wait so we don't re-enter immediately
+        wait_for_zone_exit = True
+        print(f"[{now_str()}] ⏳ TP hit or manual close - waiting for RSI zone exit", flush=True)
+
+    in_position = False
+    current_position = None
 
 # ========== STARTUP ==========
-print(f"[{now_str()}] 🚀 BOT STARTING (EMA filter + debug={'ON' if DEBUG else 'OFF'})")
+print(f"[{now_str()}] 🚀 BOT STARTING (EMA filter + robust SL/TP placement)")
 show_balance()
 
 # ========== MAIN LOOP ==========
 while True:
     try:
         now_utc = datetime.now(timezone.utc)
+        # balance print
         if last_balance_check is None or (now_utc - last_balance_check).total_seconds() >= balance_check_interval:
             show_balance()
             last_balance_check = now_utc
 
-        # if in-position: watch for close
+        # if bot thinks in position -> poll exchange for real size
         if in_position:
             size = fetch_position_size()
             if abs(size) < 1e-8:
-                # if exchange reports closed, get last price and call close handler
+                # position closed on exchange
                 try:
                     ticker = exchange.fetch_ticker(SYMBOL)
                     exit_price = float(ticker.get("last") or ticker.get("close"))
@@ -373,64 +369,54 @@ while True:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # cooldown check
+        # cooldown block
         if cooldown_until_utc and now_utc < cooldown_until_utc:
             remaining = (cooldown_until_utc - now_utc).total_seconds() / 60
-            dbg(f"[{now_str()}] 🧊 Cooldown active ({remaining:.1f} min), skipping entries")
+            print(f"[{now_str()}] 🧊 Cooldown: {remaining:.1f} min left", flush=True)
             time.sleep(POLL_INTERVAL)
             continue
 
-        # fetch OHLCV safe
-        try:
-            ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit= max(RSI_PERIOD + 5, 50))
-        except Exception as e:
-            dbg(f"[{now_str()}] ⚠️ fetch_ohlcv failed: {e}")
-            if DEBUG:
-                traceback.print_exc()
-            time.sleep(POLL_INTERVAL)
-            continue
-
+        # fetch ohlcv and indicators
+        ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=RSI_PERIOD + 10)
         if not ohlc or len(ohlc) < RSI_PERIOD + 3:
-            dbg(f"[{now_str()}] ⚠️ Not enough OHLCV data, got {len(ohlc) if ohlc else 0} rows")
+            print(f"[{now_str()}] ⚠️ Not enough candles, skipping", flush=True)
             time.sleep(POLL_INTERVAL)
             continue
 
-        df = pd.DataFrame(ohlc, columns=["t","o","h","l","c","v"])
-        df["rsi"] = rsi_wilder(df["c"], RSI_PERIOD)
-        df["ema_fast"] = ema(df["c"], EMA_FAST)
-        df["ema_slow"] = ema(df["c"], EMA_SLOW)
+        df = pd.DataFrame(ohlc, columns=["time", "open", "high", "low", "close", "volume"])
+        df["rsi"] = rsi_wilder(df["close"], RSI_PERIOD)
+        df["ema_fast"] = ema(df["close"], EMA_FAST)
+        df["ema_slow"] = ema(df["close"], EMA_SLOW)
 
         prev = df.iloc[-3]
         last = df.iloc[-2]
-        next_open = df.iloc[-1]["o"]
+        next_open = df.iloc[-1]["open"]
 
-        prev_rsi = float(prev["rsi"]) if pd.notna(prev["rsi"]) else 0.0
-        last_rsi = float(last["rsi"]) if pd.notna(last["rsi"]) else 0.0
-        ema_fast = float(last["ema_fast"]) if pd.notna(last["ema_fast"]) else 0.0
-        ema_slow = float(last["ema_slow"]) if pd.notna(last["ema_slow"]) else 0.0
+        prev_rsi = float(prev["rsi"])
+        last_rsi = float(last["rsi"])
+        ema_fast_v = float(last["ema_fast"])
+        ema_slow_v = float(last["ema_slow"])
 
-        dbg(f"[{now_str()}] 🕯 prev_rsi={prev_rsi:.2f} last_rsi={last_rsi:.2f} ema_fast={ema_fast:.4f} ema_slow={ema_slow:.4f} next_open={next_open:.4f}")
+        # debug print
+        print(f"[{now_str()}] 🔎 prev_rsi={prev_rsi:.2f} last_rsi={last_rsi:.2f} ema_fast={ema_fast_v:.4f} ema_slow={ema_slow_v:.4f}", flush=True)
 
-        # WAIT after TP/manual
+        # wait for RSI zone exit after TP/manual
         if wait_for_zone_exit and (RSI_LOW < last_rsi < RSI_HIGH):
-            dbg(f"[{now_str()}] 🚫 Waiting for RSI to exit zone before next trade")
+            print(f"[{now_str()}] 🚫 Waiting RSI exit from zone ({RSI_LOW}-{RSI_HIGH})", flush=True)
             time.sleep(POLL_INTERVAL)
             continue
         if wait_for_zone_exit and (last_rsi <= RSI_LOW or last_rsi >= RSI_HIGH):
             wait_for_zone_exit = False
-            dbg(f"[{now_str()}] ✅ RSI exited zone - new entries allowed")
+            print(f"[{now_str()}] ✅ RSI left zone - new entries allowed", flush=True)
 
+        # strategy signal + EMA trend filter
         signal = None
-
-        # === BUY CONDITION ===
-        if (prev_rsi < RSI_LOW and RSI_LOW < last_rsi < RSI_HIGH and ema_fast > ema_slow):
+        if prev_rsi < RSI_LOW and (RSI_LOW < last_rsi < RSI_HIGH) and ema_fast_v > ema_slow_v:
             signal = "BUY"
-
-        # === SELL CONDITION ===
-        elif (prev_rsi > RSI_HIGH and RSI_LOW < last_rsi < RSI_HIGH and ema_fast < ema_slow):
+            print(f"[{now_str()}] 📈 Signal BUY", flush=True)
+        elif prev_rsi > RSI_HIGH and (RSI_LOW < last_rsi < RSI_HIGH) and ema_fast_v < ema_slow_v:
             signal = "SELL"
-
-        dbg(f"[{now_str()}] 🔔 signal={signal}")
+            print(f"[{now_str()}] 📉 Signal SELL", flush=True)
 
         if signal:
             safe_enter_trade(signal, float(next_open))
@@ -442,8 +428,6 @@ while True:
         show_balance()
         break
     except Exception as e:
-        print(f"[{now_str()}] ⚠️ Loop error: {e}")
+        print(f"[{now_str()}] ⚠️ Loop error: {e}", flush=True)
         log.error("Loop error: %s", e)
-        if DEBUG:
-            traceback.print_exc()
-        time.sleep(3)
+        time.sleep(2)
