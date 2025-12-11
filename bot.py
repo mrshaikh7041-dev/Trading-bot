@@ -5,7 +5,6 @@ import time
 import csv
 import os
 import logging
-import traceback
 from datetime import datetime, timezone, timedelta
 
 # ========== USER CONFIG ==========
@@ -22,13 +21,13 @@ SL_POINTS = 0.016
 POLL_INTERVAL = 5
 COOLDOWN_MINUTES = 15
 
-EMA_FAST = 13   # you wanted scalping: default example
+EMA_FAST = 13     # you said you prefer 13/34 for scalping
 EMA_SLOW = 34
 
 LOG_FILE = "/home/ubuntu/Trading-bot/bot.log"
 CSV_FILE = f"{SYMBOL.replace('/', '-')}_trades.csv"
 
-# (you said keys are fake — replace if needed)
+# ----- put your keys (you said they're fake for dev) -----
 API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
 API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
 
@@ -42,10 +41,12 @@ log = logging.getLogger(__name__)
 
 # ========== TIME HELPERS ==========
 IST = timezone(timedelta(hours=5, minutes=30))
-def now_ist(): return datetime.now(timezone.utc).astimezone(IST)
-def now_str(): return now_ist().strftime("%Y-%m-%d %H:%M:%S %Z")
+def now_ist():
+    return datetime.now(timezone.utc).astimezone(IST)
+def now_str():
+    return now_ist().strftime("%Y-%m-%d %H:%M:%S %Z")
 
-# ========== EXCHANGE ==========
+# ========== EXCHANGE SETUP ==========
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
@@ -73,15 +74,41 @@ balance_check_interval = 30
 
 initial_balance = None
 current_balance = None
+total_profit = 0.0
 
 # ========== HELPERS ==========
-def safe_print(*args, **kwargs):
-    print(f"[{now_str()}]", *args, **kwargs, flush=True)
+def safe_get(d, *keys, default=None):
+    try:
+        for k in keys:
+            d = d[k]
+        return d
+    except Exception:
+        return default
 
 def fetch_balance_usdt():
     try:
         bal = exchange.fetch_balance()
-        usdt = bal.get("USDT") or bal.get("USDT.T") or {}
+        # try unified structure
+        usdt = None
+        if isinstance(bal, dict):
+            if "USDT" in bal:
+                usdt = bal["USDT"]
+            elif "total" in bal and isinstance(bal["total"], dict) and "USDT" in bal["total"]:
+                usdt = bal["total"]["USDT"]
+            else:
+                # older ccxt returns nested "info"
+                info = bal.get("info", {})
+                # some endpoints return 'assets' or 'account'
+                # fallback: try find USDT in top-level keys
+                if "USDT" in bal:
+                    usdt = bal["USDT"]
+        if usdt is None:
+            # fallback to parsing 'info' positions for walletBalance
+            info = bal.get("info", {})
+            if "total" in info and isinstance(info["total"], (int,float)):
+                return {"free": float(bal.get("free",0)), "used": float(bal.get("used",0)), "total": float(bal.get("total",0))}
+            # last resort: try 'free'/'used' numbers
+            return {"free": float(bal.get("free",0)), "used": float(bal.get("used",0)), "total": float(bal.get("total",0))}
         return {
             "free": float(usdt.get("free", 0.0)),
             "used": float(usdt.get("used", 0.0)),
@@ -92,28 +119,25 @@ def fetch_balance_usdt():
         return None
 
 def show_balance():
-    global initial_balance, current_balance
+    global initial_balance, current_balance, total_profit
     b = fetch_balance_usdt()
     if not b:
-        safe_print("⚠️ Balance unavailable")
+        print(f"[{now_str()}] ⚠️ BAL fetch failed", flush=True)
         return
     current_balance = b["total"]
     if initial_balance is None:
         initial_balance = current_balance
-    pnl = current_balance - initial_balance
-    pct = (pnl / initial_balance) * 100 if initial_balance else 0.0
-    safe_print(f"💰 BAL: ${current_balance:.2f} | PNL: ${pnl:+.2f} ({pct:+.2f}%) | FREE {b['free']:.2f}")
+    total_profit = current_balance - initial_balance
+    pct = (total_profit / initial_balance) * 100 if initial_balance and initial_balance != 0 else 0.0
+    print(f"[{now_str()}] 💰 BAL: ${current_balance:.2f} | PNL: ${total_profit:+.2f} ({pct:+.2f}%) | FREE: ${b['free']:.2f}", flush=True)
 
 def append_csv(row: dict):
     exists = os.path.isfile(CSV_FILE)
-    try:
-        with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=row.keys())
-            if not exists:
-                w.writeheader()
-            w.writerow(row)
-    except Exception as e:
-        log.error("append_csv error: %s", e)
+    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=row.keys())
+        if not exists:
+            w.writeheader()
+        w.writerow(row)
 
 def rsi_wilder(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -127,280 +151,276 @@ def ema(series: pd.Series, period: int):
 def fetch_position_size():
     try:
         bal = exchange.fetch_balance()
-        info_positions = bal.get("info", {}).get("positions", [])
-        for p in info_positions:
+        info = bal.get("info", {})
+        positions = info.get("positions") or safe_get(bal, "info", "positions") or []
+        for p in positions:
+            # symbol in positions usually like "XRPUSDT"
             if p.get("symbol") == FUT_SYMBOL:
-                return float(p.get("positionAmt", "0") or 0)
+                return float(p.get("positionAmt", 0.0))
     except Exception as e:
-        log.error("fetch_position_size error: %s", e)
+        log.debug("fetch_position_size error: %s", e)
     return 0.0
 
-# ========== ORDER HELPERS ==========
-def cancel_all_open_orders_safe():
+# ========== ORDER / SL PLACEMENT with FALLBACKS ==========
+def cancel_all_open_orders():
     try:
         orders = exchange.fetch_open_orders(SYMBOL)
         for o in orders:
             try:
                 exchange.cancel_order(o['id'], SYMBOL)
-                safe_print(f"❌ Cancelled order {o.get('id')}")
-            except Exception as ee:
-                safe_print("⚠ cancel failed for", o.get('id'), ee)
+            except Exception as e:
+                log.warning("cancel order fail %s: %s", o.get('id'), e)
     except Exception as e:
-        log.error("fetch_open_orders error: %s", e)
+        log.debug("fetch_open_orders fail: %s", e)
 
-def fetch_last_price():
+def place_tp(side_close, amount, tp_price):
     try:
-        t = exchange.fetch_ticker(SYMBOL)
-        return float(t.get("last") or t.get("close") or 0.0)
-    except:
-        return 0.0
-
-def place_entry_with_tp_sl(side: str, approx_price: float):
-    """
-    Place market entry then place TP (limit reduceOnly) and SL (stop_market reduceOnly).
-    Returns (entry_price, tp_price, sl_price) or raises.
-    """
-    close_side = "sell" if side == "BUY" else "buy"
-    try:
-        order = exchange.create_order(SYMBOL, "market", side.lower(), LOT_SIZE)
+        # regular limit reduceOnly TP
+        return exchange.create_order(SYMBOL, 'limit', side_close, amount, tp_price, {'reduceOnly': True, 'timeInForce': 'GTC'})
     except Exception as e:
-        # some exchanges return different errors — log and rethrow
-        log.error("market order failed: %s", e)
+        log.warning("TP place failed: %s", e)
+        return None
+
+def place_sl_fallbacks(side_close, amount, sl_price):
+    """
+    Try 3 ways to place SL (stop-market primary, alt stop type, stop-limit fallback).
+    Returns order if succeeded else None and final exception list.
+    """
+    exceptions = []
+    # ATTEMPT 1: stop_market (preferred)
+    try:
+        o = exchange.create_order(SYMBOL, 'stop_market', side_close, amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
+        log.info("SL placed (stop_market) %s", o)
+        return o, exceptions
+    except Exception as e:
+        exceptions.append(("stop_market", str(e)))
+        log.warning("SL stop_market failed: %s", e)
+
+    time.sleep(0.5)
+
+    # ATTEMPT 2: try 'stop' / 'STOP' hybrid (some ccxt/binance variants accept it)
+    try:
+        o = exchange.create_order(SYMBOL, 'stop', side_close, amount, None, {'stopPrice': sl_price, 'reduceOnly': True})
+        log.info("SL placed (stop) %s", o)
+        return o, exceptions
+    except Exception as e:
+        exceptions.append(("stop", str(e)))
+        log.warning("SL stop failed: %s", e)
+
+    time.sleep(0.5)
+
+    # ATTEMPT 3: stop-limit style (limit close at SL or slightly offset)
+    try:
+        # place a limit close at SL_price with reduceOnly as fallback
+        o = exchange.create_order(SYMBOL, 'limit', side_close, amount, sl_price, {'reduceOnly': True, 'timeInForce':'GTC'})
+        log.info("SL placed (limit fallback) %s", o)
+        return o, exceptions
+    except Exception as e:
+        exceptions.append(("limit_fallback", str(e)))
+        log.warning("SL limit fallback failed: %s", e)
+
+    return None, exceptions
+
+def place_entry_with_tp_sl(side, approx_price):
+    """
+    Places market entry then TP and SL with fallback logic for SL.
+    Returns (entry_price, tp_price, sl_price, succeeded_bool)
+    """
+    close_side = 'sell' if side == 'BUY' else 'buy'
+    try:
+        order = exchange.create_order(SYMBOL, 'market', side.lower(), LOT_SIZE)
+    except Exception as e:
+        log.error("Market entry failed: %s", e)
         raise
 
-    # get executed average or fallback to approx/fetch
-    entry_price = None
-    try:
-        entry_price = float(order.get("average") or order.get("price") or approx_price)
-    except Exception:
-        entry_price = approx_price
+    # attempt to get average/price
+    entry_price = float(order.get('average') or order.get('price') or approx_price or 0.0)
 
-    if not entry_price or entry_price == 0:
-        # try fetch last price
-        entry_price = fetch_last_price()
-
-    if side == "BUY":
+    if side == 'BUY':
         tp_price = entry_price + TP_POINTS
         sl_price = entry_price - SL_POINTS
     else:
         tp_price = entry_price - TP_POINTS
         sl_price = entry_price + SL_POINTS
 
-    # place TP (limit reduceOnly)
+    # Place TP (limit reduceOnly) - usually works
+    tp_order = None
     try:
-        exchange.create_order(
-            SYMBOL, "limit", close_side, LOT_SIZE, round(tp_price, 8),
-            {"reduceOnly": True, "timeInForce": "GTC"}
-        )
+        tp_order = place_tp(close_side, LOT_SIZE, tp_price)
     except Exception as e:
-        log.error("TP order failed: %s", e)
-        # continue — we still try to place SL
+        log.warning("TP place problematic: %s", e)
 
-    # place SL (stop_market reduceOnly)
-    try:
-        exchange.create_order(
-            SYMBOL, "stop_market", close_side, LOT_SIZE, None,
-            {"stopPrice": round(sl_price, 8), "reduceOnly": True}
-        )
-    except Exception as e:
-        log.error("SL order failed: %s", e)
-        # If SL failed, we must be careful; but return values for bookkeeping.
+    # Place SL with multiple fallback attempts
+    sl_order, exceptions = place_sl_fallbacks(close_side, LOT_SIZE, sl_price)
+    if sl_order is None:
+        # SL placement failed across methods -> do not force close immediately.
+        # Log exceptions and return with flag so caller can decide.
+        log.error("All SL placement methods failed. Exceptions: %s", exceptions)
+        return entry_price, tp_price, sl_price, False, exceptions
 
-    return entry_price, tp_price, sl_price
+    return entry_price, tp_price, sl_price, True, None
 
-# ========== TRADING LOGIC ==========
-def can_enter_trade():
-    global in_position, cooldown_until_utc, current_position
-    now_utc = datetime.now(timezone.utc)
-
-    if cooldown_until_utc and now_utc < cooldown_until_utc:
-        safe_print("🧊 Cooldown active — no entry")
-        return False
-
-    ex_size = fetch_position_size()
-    if abs(ex_size) > 1e-8:
-        # exchange has position - sync
-        side = "BUY" if ex_size > 0 else "SELL"
-        if not in_position:
-            safe_print(f"🔁 Syncing: exchange position exists size={ex_size:.4f} -> set in_position True")
-            in_position = True
-            current_position = {"side": side, "entry": 0.0, "time": now_str()}
-        return False
-
-    # reset bot state if mismatch
-    if in_position and abs(ex_size) < 1e-8:
-        safe_print("🔄 Bot thought in_position but exchange size 0 -> resetting")
-        in_position = False
-
-    return not in_position
-
-def safe_enter_trade(signal: str, signal_candle: dict, next_open_price: float):
-    """
-    Confirm breakout: next_open must break signal candle high (BUY) or low (SELL)
-    Then place market entry + TP/SL
-    """
-    global in_position, current_position, cooldown_until_utc
-
-    safe_print(f"🔍 Checking entry {signal}, signal_candle H:{signal_candle['high']:.6f} L:{signal_candle['low']:.6f} next_open:{next_open_price:.6f}")
-
-    if not can_enter_trade():
-        safe_print("❌ Entry blocked by can_enter_trade")
-        return
-
-    # confirmation: breakout of signal candle
-    if signal == "BUY":
-        if next_open_price <= float(signal_candle["high"]):
-            safe_print("❌ BUY blocked - next open did not break signal high")
-            return
-    else:  # SELL
-        if next_open_price >= float(signal_candle["low"]):
-            safe_print("❌ SELL blocked - next open did not break signal low")
-            return
-
-    # passed confirmation -> place orders
-    try:
-        entry, tp, sl = place_entry_with_tp_sl(signal, next_open_price)
-        in_position = True
-        current_position = {"side": signal, "entry": entry, "time": now_str()}
-        safe_print(f"✅ ENTERED {signal} @ {entry:.6f} | TP={tp:.6f} SL={sl:.6f}")
-        log.info("Entered %s @ %.6f", signal, entry)
-    except Exception as e:
-        safe_print("❌ Entry exception:", e)
-        log.error("Entry exception: %s\n%s", e, traceback.format_exc())
-
+# ========== ON POSITION CLOSED ==========
 def on_position_closed(exit_price: float):
-    """
-    Handle position closed event: compute pnl, write csv, enable RSI wait, cancel leftover orders.
-    """
     global in_position, current_position, cooldown_until_utc, wait_for_zone_exit
-
     if current_position is None:
-        safe_print("⚠ on_position_closed called but current_position is None")
         return
-
     side = current_position["side"]
     entry = current_position["entry"]
     pnl = (exit_price - entry) * LOT_SIZE if side == "BUY" else (entry - exit_price) * LOT_SIZE
-
     append_csv({
-        "time": now_str(),
+        "time": current_position.get("time", now_str()),
         "side": side,
-        "entry": round(entry, 8),
-        "exit": round(exit_price, 8),
-        "pnl": round(pnl, 8),
-        "note": "AUTO_CLOSE"
+        "entry": entry,
+        "exit": exit_price,
+        "pnl": round(pnl,6),
+        "note": "AUTO-CLOSE"
     })
-
-    # if loss -> cooldown
-    if pnl < 0:
-        cooldown_until_utc = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
-        safe_print(f"🔥 Loss detected -> cooldown until {cooldown_until_utc.isoformat()}")
-    else:
-        wait_for_zone_exit = True
-        safe_print("✅ Profit -> enabling zone wait before new entries")
-
-    # cancel any leftover orders
-    cancel_all_open_orders_safe()
-
-    safe_print(f"📊 EXIT {side} @ {exit_price:.6f} | PNL={pnl:.6f}")
+    wait_for_zone_exit = True
+    # cancel leftover orders
+    cancel_all_open_orders()
     in_position = False
     current_position = None
+    # cooldown on negative pnl
+    if pnl < 0:
+        cooldown_until_utc = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
+        print(f"[{now_str()}] 🧊 Cooldown set for {COOLDOWN_MINUTES} minutes due to losing trade.", flush=True)
 
 # ========== STARTUP ==========
-safe_print("🚀 BOT STARTING (RSI REV + EMA + BREAKOUT CONFIRMATION)")
-safe_print(f"Config: RSI({RSI_LOW}-{RSI_HIGH}), EMA {EMA_FAST}/{EMA_SLOW}, TP {TP_POINTS}, SL {SL_POINTS}")
+print(f"[{now_str()}] 🚀 RSI REV BOT STARTING (EMA filter + SL-fallbacks)", flush=True)
+print(f"[{now_str()}] ⚙️ Config: RSI({RSI_LOW}-{RSI_HIGH}) EMA({EMA_FAST}/{EMA_SLOW}) TP={TP_POINTS} SL={SL_POINTS}", flush=True)
 show_balance()
 
 # ========== MAIN LOOP ==========
 while True:
     try:
         now_utc = datetime.now(timezone.utc)
-        if last_balance_check is None or (now_utc - (last_balance_check or now_utc)).total_seconds() >= balance_check_interval:
+        if last_balance_check is None or (now_utc - last_balance_check).total_seconds() >= balance_check_interval:
             show_balance()
             last_balance_check = now_utc
 
-        # if bot thinks in position -> wait for exchange to close
+        # if we think we're in a trade, watch for actual exchange position closed
         if in_position:
             size = fetch_position_size()
             if abs(size) < 1e-8:
                 # position closed on exchange
-                exit_price = fetch_last_price() or current_position.get("entry", 0.0)
+                try:
+                    ticker = exchange.fetch_ticker(SYMBOL)
+                    exit_price = float(ticker.get('last') or ticker.get('close'))
+                except Exception:
+                    exit_price = current_position.get('entry', 0.0)
                 on_position_closed(exit_price)
             time.sleep(POLL_INTERVAL)
             continue
 
-        # cooldown check
+        # Cooldown check
         if cooldown_until_utc and now_utc < cooldown_until_utc:
-            remaining = (cooldown_until_utc - now_utc).total_seconds() / 60
-            safe_print(f"🧊 Cooldown active ({remaining:.1f} min left)")
+            remain = (cooldown_until_utc - now_utc).total_seconds()/60
+            print(f"[{now_str()}] 🧊 Cooldown active: {remain:.1f} minutes", flush=True)
             time.sleep(POLL_INTERVAL)
             continue
 
-        # fetch ohlcv
-        ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=max(RSI_PERIOD + 5, EMA_SLOW + 5))
-        df = pd.DataFrame(ohlc, columns=["time", "open", "high", "low", "close", "volume"])
-
-        if len(df) < max(RSI_PERIOD + 3, EMA_SLOW + 3):
-            safe_print("⚠ Not enough candles yet")
-            time.sleep(POLL_INTERVAL)
-            continue
+        # fetch candles
+        ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=max(RSI_PERIOD+5, 50))
+        df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
 
         df["rsi"] = rsi_wilder(df["close"], RSI_PERIOD)
         df["ema_fast"] = ema(df["close"], EMA_FAST)
         df["ema_slow"] = ema(df["close"], EMA_SLOW)
 
-        # pick candles: prev(signal candle index = -3), last closed = -2, next_open candle = -1
-        prev = df.iloc[-3]      # this is the candle before last closed
-        last_closed = df.iloc[-2]   # signal candle
-        next_candle = df.iloc[-1]   # the candle to use open for breakout confirmation
+        if len(df) < 4:
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        prev = df.iloc[-3]
+        last = df.iloc[-2]
+        next_open = df.iloc[-1]["open"]
 
         prev_rsi = float(prev["rsi"])
-        last_rsi = float(last_closed["rsi"])
-        next_open = float(next_candle["open"])
-        ema_fast_val = float(last_closed["ema_fast"])
-        ema_slow_val = float(last_closed["ema_slow"])
+        last_rsi = float(last["rsi"])
+        ema_fast = float(last["ema_fast"])
+        ema_slow = float(last["ema_slow"])
 
-        safe_print(f"prev_rsi={prev_rsi:.2f} last_rsi={last_rsi:.2f} ema_f={ema_fast_val:.4f} ema_s={ema_slow_val:.4f} next_open={next_open:.6f}")
+        print(f"[{now_str()}] 🔔 prev_rsi={prev_rsi:.2f} last_rsi={last_rsi:.2f} ema_f={ema_fast:.4f} ema_s={ema_slow:.4f}", flush=True)
 
-        # wait_for_zone_exit logic (after TP / manual)
+        # wait after TP/manual until RSI exits zone
         if wait_for_zone_exit and (RSI_LOW < last_rsi < RSI_HIGH):
-            safe_print("🚫 Waiting for RSI to exit zone before next trade")
+            print(f"[{now_str()}] 🚫 Waiting: RSI still in zone ({RSI_LOW}-{RSI_HIGH})", flush=True)
             time.sleep(POLL_INTERVAL)
             continue
         if wait_for_zone_exit and (last_rsi <= RSI_LOW or last_rsi >= RSI_HIGH):
             wait_for_zone_exit = False
-            safe_print("✅ RSI exited zone - new entries allowed")
+            print(f"[{now_str()}] ✅ RSI exited zone - can enter again", flush=True)
 
-        # signal detection
+        # signal generation with EMA trend filter
         signal = None
-        if prev_rsi < RSI_LOW and (RSI_LOW < last_rsi < RSI_HIGH):
-            # potential BUY
-            if ema_fast_val > ema_slow_val:
-                signal = "BUY"
-                safe_print("📈 Condition: RSI cross into zone + EMA up -> BUY candidate")
-            else:
-                safe_print("📉 BUY candidate but EMA not up -> blocked")
-        elif prev_rsi > RSI_HIGH and (RSI_LOW < last_rsi < RSI_HIGH):
-            # potential SELL
-            if ema_fast_val < ema_slow_val:
-                signal = "SELL"
-                safe_print("📉 Condition: RSI cross into zone + EMA down -> SELL candidate")
-            else:
-                safe_print("📈 SELL candidate but EMA not down -> blocked")
+        if prev_rsi < RSI_LOW and (RSI_LOW < last_rsi < RSI_HIGH) and ema_fast > ema_slow:
+            signal = "BUY"
+        elif prev_rsi > RSI_HIGH and (RSI_LOW < last_rsi < RSI_HIGH) and ema_fast < ema_slow:
+            signal = "SELL"
 
-        # If we have a signal -> require breakout confirmation using next_open vs last_closed's high/low
         if signal:
-            signal_candle = {"high": float(last_closed["high"]), "low": float(last_closed["low"])}
-            safe_enter_trade(signal, signal_candle, next_open)
+            print(f"[{now_str()}] 🚀 Signal detected: {signal} - trying safe enter", flush=True)
+            try:
+                entry, tp, sl, sl_ok, sl_exceptions = place_entry_with_tp_sl(signal, float(next_open))
+                # if SL placement failed across all methods
+                if not sl_ok:
+                    # DON'T force-close immediately. Retry placing SL a couple more times with delays
+                    print(f"[{now_str()}] ⚠️ SL initial placement failed, will retry more carefully", flush=True)
+                    # small retries
+                    retry_ok = False
+                    for attempt in range(3):
+                        time.sleep(1 + attempt*0.5)
+                        o, exs = None, None
+                        try:
+                            close_side = 'sell' if signal == 'BUY' else 'buy'
+                            o, exs = place_sl_fallbacks(close_side, LOT_SIZE, sl)
+                        except Exception as e:
+                            log.warning("retry SL attempt error: %s", e)
+                        if o:
+                            retry_ok = True
+                            break
+                    if not retry_ok:
+                        # ALL retries failed -> now as last resort we try to close via market to avoid unprotected position
+                        print(f"[{now_str()}] ❗ All SL retries failed. As last resort: will MARKET-CLOSE to avoid unprotected position", flush=True)
+                        try:
+                            # cancel open TP if present, then close market opposite
+                            cancel_all_open_orders()
+                            close_side = 'sell' if signal == 'BUY' else 'buy'
+                            # market close
+                            exchange.create_order(SYMBOL, 'market', close_side, LOT_SIZE)
+                            print(f"[{now_str()}] ⚠️ Forced market close executed after SL failed", flush=True)
+                            append_csv({
+                                "time": now_str(),
+                                "side": signal,
+                                "entry": entry,
+                                "exit": None,
+                                "pnl": None,
+                                "note": "FORCED_MARKET_CLOSE_SL_FAIL"
+                            })
+                        except Exception as e:
+                            log.critical("Forced market close also failed: %s", e)
+                    else:
+                        # retry succeeded: mark in_position and current_position
+                        in_position = True
+                        current_position = {"side": signal, "entry": entry, "time": now_str()}
+                        print(f"[{now_str()}] ✅ Enter recorded (after retry) {signal} @ {entry:.4f} TP {tp:.4f} SL {sl:.4f}", flush=True)
+                else:
+                    # SL ok on first attempt
+                    in_position = True
+                    current_position = {"side": signal, "entry": entry, "time": now_str()}
+                    print(f"[{now_str()}] ✅ ENTERED {signal} @ {entry:.4f} | TP {tp:.4f} SL {sl:.4f}", flush=True)
+            except Exception as e:
+                print(f"[{now_str()}] ❌ Entry routine failed: {e}", flush=True)
+                log.error("Entry routine error: %s", e)
 
         time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
-        safe_print("⛔ Bot stopped by user")
+        print(f"[{now_str()}] ⛔ Bot stopping by user", flush=True)
         show_balance()
         break
-
     except Exception as e:
-        safe_print("⚠️ Loop error:", e)
-        log.error("Loop error: %s\n%s", e, traceback.format_exc())
-        time.sleep(3)
+        print(f"[{now_str()}] ⚠️ Loop error: {e}", flush=True)
+        log.error("Loop error: %s", e)
+        time.sleep(2)
