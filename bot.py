@@ -2,15 +2,16 @@
 import ccxt
 import pandas as pd
 import time
+import csv
+import os
 import logging
 from datetime import datetime, timezone, timedelta
 
-# ================= USER CONFIG =================
+# ========== USER CONFIG ==========
 SYMBOL = "AVAX/USDT"
 TIMEFRAME = "1m"
 
 LOT_SIZE = 1
-
 RSI_PERIOD = 14
 RSI_LOW = 10
 RSI_HIGH = 37
@@ -30,87 +31,79 @@ CSV_FILE = f"{SYMBOL.replace('/', '-')}_trades.csv"
 API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
 API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
 
-# ================= LOGGING =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-log = logging.getLogger()
+# ========== LOGGING ==========
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
 
-# ================= TIME =================
+# ========== TIME ==========
 IST = timezone(timedelta(hours=5, minutes=30))
-def now_ist():
-    return datetime.now(timezone.utc).astimezone(IST)
+def now_str():
+    return datetime.now(timezone.utc).astimezone(IST).strftime("%Y-%m-%d %H:%M:%S")
 
-# ================= EXCHANGE =================
+# ========== EXCHANGE ==========
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
     "options": {"defaultType": "future"},
 })
+exchange.options["adjustForTimeDifference"] = True
 exchange.load_markets()
 exchange.set_leverage(75, SYMBOL)
+
 FUT_SYMBOL = SYMBOL.replace("/", "")
 
-# ================= STATE =================
+# ========== STATE ==========
 in_position = False
 current_position = None
-cooldown_until = None
+cooldown_until_utc = None
 wait_for_zone_exit = False
 
-# ================= INDICATORS =================
+# ========== INDICATORS ==========
 def rsi(series, p=14):
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/p, adjust=False).mean()
-    rs = gain / loss
+    rs = gain / loss.replace(0, 1e-10)
     return 100 - (100 / (1 + rs))
 
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-# ================= POSITION =================
+# ========== POSITION ==========
 def fetch_position_size():
-    bal = exchange.fetch_balance()
-    for p in bal["info"]["positions"]:
-        if p["symbol"] == FUT_SYMBOL:
-            return float(p["positionAmt"])
+    try:
+        bal = exchange.fetch_balance()
+        for p in bal["info"]["positions"]:
+            if p["symbol"] == FUT_SYMBOL:
+                return float(p["positionAmt"])
+    except:
+        pass
     return 0.0
 
-# ================= SL WATCHER =================
-def sl_hit(side, sl_price):
-    last_price = float(exchange.fetch_ticker(SYMBOL)["last"])
-    if side == "BUY" and last_price <= sl_price:
-        return True
-    if side == "SELL" and last_price >= sl_price:
-        return True
-    return False
+# ========== SL WATCHER (BOT LEVEL) ==========
+def sl_watcher():
+    if not current_position:
+        return
+    side = current_position["side"]
+    sl = current_position["sl"]
+    price = float(exchange.fetch_ticker(SYMBOL)["last"])
 
-# ================= ENTRY =================
-def place_entry(side):
-    close_side = "sell" if side == "BUY" else "buy"
+    if side == "BUY" and price <= sl:
+        log.warning("🛑 BOT SL HIT (BUY)")
+        force_close(price)
 
-    order = exchange.create_order(
-        SYMBOL, "market", side.lower(), LOT_SIZE
-    )
-    entry = float(order["average"])
+    if side == "SELL" and price >= sl:
+        log.warning("🛑 BOT SL HIT (SELL)")
+        force_close(price)
 
-    tp = entry + TP_POINTS if side == "BUY" else entry - TP_POINTS
-    sl = entry - SL_POINTS if side == "BUY" else entry + SL_POINTS
-
-    # ✅ TP only (NO STOP_MARKET SL)
-    exchange.create_order(
-        SYMBOL,
-        "limit",
-        close_side,
-        LOT_SIZE,
-        tp,
-        {"reduceOnly": True}
-    )
-
-    return entry, tp, sl
-
-# ================= EXIT =================
-def close_position(price):
-    global in_position, current_position, cooldown_until, wait_for_zone_exit
+# ========== FORCE CLOSE ==========
+def force_close(price):
+    global in_position, current_position, cooldown_until_utc
 
     side = current_position["side"]
     close_side = "sell" if side == "BUY" else "buy"
@@ -123,49 +116,65 @@ def close_position(price):
         {"reduceOnly": True}
     )
 
-    pnl = (price - current_position["entry"]) * LOT_SIZE if side == "BUY" else \
-          (current_position["entry"] - price) * LOT_SIZE
-
-    log.info(f"EXIT {side} @ {price:.4f} | PNL={pnl:.4f}")
-
-    if pnl < 0:
-        cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
-    else:
-        wait_for_zone_exit = True
+    log.info(f"FORCED EXIT {side} @ {price}")
+    cooldown_until_utc = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
 
     in_position = False
     current_position = None
 
-# ================= START =================
-log.info("🚀 BOT STARTED")
+# ========== ENTRY ==========
+def place_entry(side):
+    close_side = "sell" if side == "BUY" else "buy"
 
-# ================= MAIN LOOP =================
+    order = exchange.create_order(
+        SYMBOL, "market", side.lower(), LOT_SIZE
+    )
+    entry = float(order.get("average") or exchange.fetch_ticker(SYMBOL)["last"])
+
+    tp = entry + TP_POINTS if side == "BUY" else entry - TP_POINTS
+    sl = entry - SL_POINTS if side == "BUY" else entry + SL_POINTS
+
+    # TP
+    exchange.create_order(
+        SYMBOL, "limit", close_side, LOT_SIZE, tp,
+        {"reduceOnly": True, "timeInForce": "GTC"}
+    )
+
+    # SL (correct algo endpoint)
+    try:
+        exchange.create_order(
+            SYMBOL, "stop_market", close_side, LOT_SIZE, None,
+            {"stopPrice": sl, "closePosition": True}
+        )
+        log.info("SL placed via exchange")
+    except Exception as e:
+        log.warning(f"SL exchange failed, bot watcher active: {e}")
+
+    return entry, tp, sl
+
+# ========== START ==========
+print(f"[{now_str()}] 🚀 BOT STARTED")
+
+# ========== MAIN LOOP ==========
 while True:
     try:
-        # ================= IN POSITION =================
         if in_position:
-            side = current_position["side"]
-            sl_price = current_position["sl"]
+            sl_watcher()
 
-            # ✅ BOT LEVEL SL (SAFE)
-            if sl_hit(side, sl_price):
-                log.warning(f"🛑 SL HIT (BOT) @ {sl_price:.4f}")
-                close_position(sl_price)
-
-            # TP or manual close
-            elif abs(fetch_position_size()) == 0:
+            if abs(fetch_position_size()) == 0:
                 price = float(exchange.fetch_ticker(SYMBOL)["last"])
-                close_position(price)
+                in_position = False
+                current_position = None
+                wait_for_zone_exit = True
+                log.info(f"POSITION CLOSED @ {price}")
 
             time.sleep(POLL_INTERVAL)
             continue
 
-        # ================= COOLDOWN =================
-        if cooldown_until and datetime.now(timezone.utc) < cooldown_until:
+        if cooldown_until_utc and datetime.now(timezone.utc) < cooldown_until_utc:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # ================= DATA =================
         ohlc = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=200)
         df = pd.DataFrame(ohlc, columns=["t","o","h","l","c","v"])
 
@@ -181,17 +190,13 @@ while True:
         ema_fast = float(last["ema_fast"])
         ema_slow = float(last["ema_slow"])
 
-        # ================= ZONE EXIT =================
         if wait_for_zone_exit:
             if RSI_LOW < last_rsi < RSI_HIGH:
                 time.sleep(POLL_INTERVAL)
                 continue
-            else:
-                wait_for_zone_exit = False
+            wait_for_zone_exit = False
 
         signal = None
-
-        # ================= STRATEGY =================
         if prev_rsi < RSI_LOW and RSI_LOW < last_rsi < RSI_HIGH and ema_fast > ema_slow:
             signal = "BUY"
         elif prev_rsi > RSI_HIGH and RSI_LOW < last_rsi < RSI_HIGH and ema_fast < ema_slow:
@@ -202,13 +207,14 @@ while True:
             current_position = {
                 "side": signal,
                 "entry": entry,
+                "tp": tp,
                 "sl": sl
             }
             in_position = True
-            log.info(f"ENTER {signal} @ {entry:.4f} | TP {tp:.4f} SL {sl:.4f}")
+            log.info(f"ENTER {signal} @ {entry} TP {tp} SL {sl}")
 
         time.sleep(POLL_INTERVAL)
 
     except Exception as e:
         log.error(f"ERROR: {e}")
-        time.sleep(3)
+        time.sleep(2)
