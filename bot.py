@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 0.6
+LOT_SIZE = 0.06
 
 RSI_PERIOD = 14
 RSI_LOW = 10
