@@ -67,7 +67,7 @@ def rsi(series, period=14):
     delta = series.diff()
     up = delta.where(delta > 0, 0).ewm(span=period, adjust=False).mean()
     down = (-delta.where(delta < 0, 0)).ewm(span=period, adjust=False).mean()
-    return 100 - (100 / (1 + up / down)))
+    return 100 - (100 / (1 + up / down))
 
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
