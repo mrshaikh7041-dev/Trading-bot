@@ -14,8 +14,8 @@ TIMEFRAME = "3m"
 LOT_SIZE = 0.01
 
 RSI_PERIOD = 14
-TP_POINTS = 7.0       # +7 PRICE POINTS
-SL_POINTS = 4.0       # -4 PRICE POINTS
+TP_POINTS = 7.0
+SL_POINTS = 4.0
 
 POLL_INTERVAL = 5
 COOLDOWN_MINUTES = 15
@@ -32,7 +32,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("BNB-BOT")
 
 # ========== TIME HELPERS ==========
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -54,8 +54,8 @@ FUT_SYMBOL = SYMBOL.replace("/", "")
 
 try:
     exchange.set_leverage(75, SYMBOL)
-except:
-    pass
+except Exception as e:
+    log.warning("Leverage set failed: %s", e)
 
 # ========== STATE ==========
 in_position = False
@@ -79,8 +79,8 @@ def fetch_position_size():
         for p in bal["info"]["positions"]:
             if p["symbol"] == FUT_SYMBOL:
                 return float(p["positionAmt"])
-    except:
-        pass
+    except Exception as e:
+        log.error("fetch_position_size error: %s", e)
     return 0.0
 
 # ========== ORDER FUNCTIONS ==========
@@ -118,34 +118,38 @@ def on_position_closed(exit_price):
 
     pnl = (exit_price - entry) * LOT_SIZE if side == "BUY" else (entry - exit_price) * LOT_SIZE
 
-    # ---- TP vs SL detection ----
+    # TP vs SL
     if side == "BUY":
         result = "TP" if exit_price > entry else "SL"
     else:
         result = "TP" if exit_price < entry else "SL"
 
-    # ---- SL ONLY COOLDOWN ----
     if result == "SL":
         cooldown_until_utc = datetime.now(timezone.utc) + timedelta(minutes=COOLDOWN_MINUTES)
         print(f"[{now_str()}] ❌ SL HIT | Cooldown {COOLDOWN_MINUTES} min", flush=True)
+        log.info(f"SL HIT | Cooldown {COOLDOWN_MINUTES} min")
     else:
         cooldown_until_utc = None
         print(f"[{now_str()}] ✅ TP HIT | No cooldown", flush=True)
+        log.info("TP HIT | No cooldown")
 
     print(f"[{now_str()}] 📊 EXIT {side} @ {exit_price:.2f} | PNL={pnl:.4f}", flush=True)
+    log.info(f"EXIT {side} @ {exit_price:.2f} RESULT={result} PNL={pnl:.4f}")
 
     in_position = False
     current_position = None
 
 # ========== START ==========
 print(f"[{now_str()}] 🚀 BNB 7-POINT BOT STARTED (SL-ONLY COOLDOWN)")
+log.info("BOT STARTED (SL-ONLY COOLDOWN)")
 
 # ========== MAIN LOOP ==========
 while True:
     try:
+        log.info("BOT LOOP ALIVE")
         now_utc = datetime.now(timezone.utc)
 
-        # ===== MONITOR POSITION =====
+        # ---- MONITOR POSITION ----
         if in_position:
             if abs(fetch_position_size()) < 1e-8:
                 price = exchange.fetch_ticker(SYMBOL)["last"]
@@ -153,14 +157,15 @@ while True:
             time.sleep(POLL_INTERVAL)
             continue
 
-        # ===== COOLDOWN CHECK =====
+        # ---- COOLDOWN ----
         if cooldown_until_utc and now_utc < cooldown_until_utc:
             remain = (cooldown_until_utc - now_utc).total_seconds() / 60
             print(f"[{now_str()}] 🧊 Cooldown active {remain:.1f} min", flush=True)
+            log.info(f"Cooldown active {remain:.1f} min")
             time.sleep(POLL_INTERVAL)
             continue
 
-        # ===== TREND (5m) =====
+        # ---- TREND (5m) ----
         htf = pd.DataFrame(
             exchange.fetch_ohlcv(SYMBOL, "5m", limit=60),
             columns=["t","o","h","l","c","v"]
@@ -171,7 +176,7 @@ while True:
         trend_up = htf["ema21"].iloc[-2] > htf["ema50"].iloc[-2]
         trend_down = htf["ema21"].iloc[-2] < htf["ema50"].iloc[-2]
 
-        # ===== ENTRY TF (3m) =====
+        # ---- ENTRY TF (3m) ----
         df = pd.DataFrame(
             exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=60),
             columns=["t","o","h","l","c","v"]
@@ -188,7 +193,6 @@ while True:
 
         if trend_up and ema21_price * 0.998 <= price <= ema21_price * 1.002 and 38 <= rsi_val <= 45:
             signal = "BUY"
-
         elif trend_down and ema21_price * 0.998 <= price <= ema21_price * 1.002 and 55 <= rsi_val <= 62:
             signal = "SELL"
 
@@ -197,12 +201,15 @@ while True:
             in_position = True
             current_position = {"side": signal, "entry": entry}
             print(f"[{now_str()}] 🚀 ENTER {signal} @ {entry:.2f} | TP={tp:.2f} SL={sl:.2f}", flush=True)
+            log.info(f"ENTER {signal} @ {entry:.2f} TP={tp:.2f} SL={sl:.2f}")
 
         time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
         print("Bot stopped")
+        log.info("BOT STOPPED MANUALLY")
         break
     except Exception as e:
         print("Loop error:", e)
+        log.error("Loop error: %s", e)
         time.sleep(3)
