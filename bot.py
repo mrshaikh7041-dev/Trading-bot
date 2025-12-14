@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 SYMBOL = "BNB/USDT"
 TIMEFRAME = "1m"
 
-LOT_SIZE = 0.06
+LOT_SIZE = 0.02
 
 RSI_PERIOD = 14
 RSI_LOW = 10
@@ -20,8 +20,8 @@ RSI_HIGH = 37
 EMA_FAST = 21
 EMA_SLOW = 50
 
-TP_POINTS = 6
-SL_POINTS = 3
+TP_POINTS = 7.80
+SL_POINTS = 4
 
 POLL_INTERVAL = 5
 COOLDOWN_MINUTES = 15
