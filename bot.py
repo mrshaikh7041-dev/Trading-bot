@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 
 # ========== USER CONFIG ==========
 SYMBOL = "BNB/USDT"
-TIMEFRAME = "1m"
+TIMEFRAME = "3m"
 
 LOT_SIZE = 0.02
 
