@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-TESTNET LIVE-SAFE TRADING BOT (PRODUCTION SAFE)
-- No double entry possible
-- Exchange-confirmed execution
-- TP detect + SL detect
+FINAL TESTNET LIVE-SAFE TRADING BOT
+✔ TP FIXED (Binance policy safe)
+✔ No double entry (exchange-level lock)
+✔ Bot-side SL
+✔ Daily DD (25% / 50%)
+✔ Leverage handled before entry
+✔ One trade at a time (portfolio lock)
 """
 
 import ccxt
@@ -11,11 +14,11 @@ import pandas as pd
 import time
 from datetime import datetime, timedelta, timezone
 
-# ================= CONFIG =================
-DAILY_DD_MODE = 100          # 25 or 50
+# ===================== USER CONFIG =====================
+DAILY_DD_MODE = 25            # 25 or 50
 LEVERAGE = 75
 TIMEFRAME = "1m"
-CHECK_INTERVAL = 2
+CHECK_INTERVAL = 2            # seconds
 COOLDOWN_MINUTES = 30
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -23,6 +26,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
 API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
 
+# ===================== EXCHANGE ========================
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
@@ -31,7 +35,7 @@ exchange = ccxt.binance({
 })
 exchange.set_sandbox_mode(False)
 
-# ================= STRATEGY CONFIG =================
+# ===================== STRATEGY CONFIG =================
 COINS = {
     "BNB/USDT": {
         "strategy": "BOLLINGER",
@@ -57,17 +61,21 @@ COINS = {
     }
 }
 
-# ================= GLOBAL STATE =================
+# ===================== GLOBAL STATE ====================
 GLOBAL_IN_TRADE = False
 CURRENT_TRADE = None
 DAY_START_BALANCE = None
 TRADING_BLOCKED = False
 COOLDOWN = {}
 
-# ================= HELPERS =================
+# ===================== HELPERS =========================
 def in_session(ts, session):
     h = ts.hour
-    return (0 <= h < 8) if session == "ASIA" else (8 <= h < 16)
+    if session == "ASIA":
+        return 0 <= h < 8
+    if session == "LONDON":
+        return 8 <= h < 16
+    return False
 
 def get_balance():
     return exchange.fetch_balance()["total"]["USDT"]
@@ -84,32 +92,32 @@ def rsi(series, p=14):
     d = series.diff()
     up = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
     dn = -d.clip(upper=0).ewm(alpha=1/p, adjust=False).mean()
-    return 100 - (100/(1+up/dn))
+    return 100 - (100 / (1 + up/dn))
 
 def bollinger(df):
     m = df["close"].rolling(20).mean()
     s = df["close"].rolling(20).std()
-    df["upper"] = m + 1.5*s
-    df["lower"] = m - 1.5*s
+    df["upper"] = m + 1.5 * s
+    df["lower"] = m - 1.5 * s
     return df
 
 def exchange_has_position(symbol):
     positions = exchange.fetch_positions([symbol])
     for p in positions:
-        if abs(float(p["contracts"])) > 0:
+        if abs(float(p.get("contracts", 0))) > 0:
             return True
     return False
 
-# ================= DAILY DD =================
+# ===================== DAILY DD ========================
 def check_daily_dd():
     global TRADING_BLOCKED
     bal = get_balance()
     limit = DAY_START_BALANCE * (DAILY_DD_MODE / 100)
     if DAY_START_BALANCE - bal >= limit:
         TRADING_BLOCKED = True
-        print("🛑 DAILY DD HIT")
+        print("🛑 DAILY DD HIT — Trading stopped for today")
 
-# ================= ORDER FUNCTIONS =================
+# ===================== ORDER FUNCTIONS =================
 def place_market(symbol, side, qty):
     exchange.set_leverage(LEVERAGE, symbol)
     if side == "BUY":
@@ -117,6 +125,7 @@ def place_market(symbol, side, qty):
     else:
         return exchange.create_market_sell_order(symbol, qty)
 
+# ✅ TP FIX (Binance-safe)
 def place_tp(symbol, side, price):
     exchange.create_order(
         symbol=symbol,
@@ -140,27 +149,29 @@ def close_position(symbol, side, qty):
         {"reduceOnly": True}
     )
 
-# ================= MAIN LOOP =================
+# ===================== MAIN LOOP =======================
 def run():
-    global GLOBAL_IN_TRADE, CURRENT_TRADE, DAY_START_BALANCE, TRADING_BLOCKED
+    global GLOBAL_IN_TRADE, CURRENT_TRADE
+    global DAY_START_BALANCE, TRADING_BLOCKED
 
     last_day = None
 
     while True:
         now = datetime.now(IST)
 
+        # ---- Daily reset ----
         if last_day != now.date():
             DAY_START_BALANCE = get_balance()
             TRADING_BLOCKED = False
             last_day = now.date()
-            print(f"\n🔄 New Day | Balance: {DAY_START_BALANCE}")
+            print(f"\n🔄 New Day Started | Balance: {DAY_START_BALANCE}")
 
         check_daily_dd()
         if TRADING_BLOCKED:
             time.sleep(10)
             continue
 
-        # ===== MONITOR MODE =====
+        # ================= MONITOR MODE =================
         if GLOBAL_IN_TRADE:
             sym = CURRENT_TRADE["symbol"]
             side = CURRENT_TRADE["side"]
@@ -169,24 +180,24 @@ def run():
 
             price = exchange.fetch_ticker(sym)["last"]
 
-            # SL detect
-            if (side == "BUY" and price <= sl):
-                print("❌ SL HIT")
+            # SL detection
+            if side == "BUY" and price <= sl:
+                print(f"❌ SL HIT {sym}")
                 close_position(sym, side, qty)
                 COOLDOWN[sym] = now + timedelta(minutes=COOLDOWN_MINUTES)
                 GLOBAL_IN_TRADE = False
                 CURRENT_TRADE = None
 
-            # TP detect
+            # TP detection (exchange closed position)
             elif not exchange_has_position(sym):
-                print("✅ TP HIT")
+                print(f"✅ TP HIT {sym}")
                 GLOBAL_IN_TRADE = False
                 CURRENT_TRADE = None
 
             time.sleep(CHECK_INTERVAL)
             continue
 
-        # ===== SCAN MODE =====
+        # ================= SCAN MODE ====================
         for symbol, cfg in COINS.items():
             if GLOBAL_IN_TRADE:
                 break
@@ -198,7 +209,7 @@ def run():
                 continue
 
             if exchange_has_position(symbol):
-                continue  # 🔒 exchange-level lock
+                continue  # exchange-level lock
 
             df = fetch_df(symbol)
             df["rsi"] = rsi(df["close"])
@@ -208,9 +219,11 @@ def run():
                 df = bollinger(df)
                 if df.iloc[-2]["low"] <= df.iloc[-2]["lower"]:
                     signal = "BUY"
+
             elif cfg["strategy"] == "RSI":
                 if df.iloc[-3]["rsi"] < cfg["rsi_low"] and df.iloc[-2]["rsi"] > cfg["rsi_low"]:
                     signal = "BUY"
+
             elif cfg["strategy"] == "FIXED":
                 signal = "BUY"
 
@@ -218,30 +231,33 @@ def run():
                 continue
 
             entry = df.iloc[-1]["open"]
-            lot = cfg["lot"]
+            qty = cfg["lot"]
 
-            tp = entry + (cfg.get("tp_usdt", cfg["tp"]) / lot if "tp_usdt" in cfg else cfg["tp"])
-            sl = entry - (cfg.get("sl_usdt", cfg["sl"]) / lot if "sl_usdt" in cfg else cfg["sl"])
+            if "tp_usdt" in cfg:
+                tp = entry + cfg["tp_usdt"] / qty
+                sl = entry - cfg["sl_usdt"] / qty
+            else:
+                tp = entry + cfg["tp"]
+                sl = entry - cfg["sl"]
 
-            margin = (entry * lot) / LEVERAGE
+            margin = (entry * qty) / LEVERAGE
             if get_balance() < margin:
                 continue
 
             print(f"🚀 ENTRY {symbol}")
-            place_market(symbol, signal, lot)
-
-            # confirm entry
+            place_market(symbol, signal, qty)
             time.sleep(1)
+
             if not exchange_has_position(symbol):
-                print("❌ ENTRY FAILED")
+                print("❌ ENTRY FAILED — no position")
                 continue
 
-            place_tp(symbol, signal, lot, tp)
+            place_tp(symbol, signal, tp)
 
             CURRENT_TRADE = {
                 "symbol": symbol,
                 "side": signal,
-                "qty": lot,
+                "qty": qty,
                 "sl": sl
             }
             GLOBAL_IN_TRADE = True
@@ -249,7 +265,7 @@ def run():
 
         time.sleep(CHECK_INTERVAL)
 
-# ================= START =================
+# ===================== START ===========================
 if __name__ == "__main__":
-    print("🧪 TESTNET BOT STARTED (DOUBLE-ENTRY SAFE)")
+    print("🧪 FINAL TESTNET BOT STARTED (TP FIXED)")
     run()
