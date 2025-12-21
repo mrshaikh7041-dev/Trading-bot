@@ -117,15 +117,20 @@ def place_market(symbol, side, qty):
     else:
         return exchange.create_market_sell_order(symbol, qty)
 
-def place_tp(symbol, side, qty, price):
+def place_tp(symbol, side, price):
     exchange.create_order(
-        symbol,
-        "TAKE_PROFIT_MARKET",
-        "sell" if side == "BUY" else "buy",
-        qty,
-        None,
-        {"stopPrice": price, "reduceOnly": True, "workingType": "MARK_PRICE"}
+        symbol=symbol,
+        type="TAKE_PROFIT_MARKET",
+        side="sell" if side == "BUY" else "buy",
+        amount=None,
+        price=None,
+        params={
+            "stopPrice": price,
+            "closePosition": True,
+            "workingType": "MARK_PRICE"
+        }
     )
+    print(f"🎯 TP PLACED @ {price}")
 
 def close_position(symbol, side, qty):
     exchange.create_market_order(
