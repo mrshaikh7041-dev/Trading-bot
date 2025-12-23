@@ -31,7 +31,7 @@ exchange = ccxt.binance({
 })
 exchange.set_sandbox_mode(False)
 
-# ================= STRATEGIES =================
+# ================= STRATEGY CONFIG =================
 COINS = {
     "BNB/USDT": {
         "strategy": "BOLLINGER",
@@ -52,8 +52,8 @@ COINS = {
         "strategy": "FIXED",
         "session": "ASIA",
         "lot": 15,
-        "tp_usdt": 0.32,
-        "sl_usdt": 0.16
+        "tp": 0.022,
+        "sl": 0.011
     }
 }
 
@@ -64,37 +64,20 @@ DAY_START_BALANCE = None
 TRADING_BLOCKED = False
 COOLDOWN = {}
 
-# ================= HELPERS =====================
+# ================= UTILITIES =================
 def log(msg):
     print(f"{datetime.now(IST)} | {msg}", flush=True)
 
 def in_session(ts, session):
-    h = ts.hour
-    return (0 <= h < 8) if session == "ASIA" else (8 <= h < 16)
+    hour = ts.hour
+    if session == "ASIA":
+        return 0 <= hour < 8
+    if session == "LONDON":
+        return 8 <= hour < 16
+    return False
 
 def get_balance():
     return exchange.fetch_balance()["total"]["USDT"]
-
-def fetch_df(symbol, limit=120):
-    df = pd.DataFrame(
-        exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit),
-        columns=["time","open","high","low","close","volume"]
-    )
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(IST)
-    return df
-
-def rsi(series, p=14):
-    d = series.diff()
-    up = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
-    dn = -d.clip(upper=0).ewm(alpha=1/p, adjust=False).mean()
-    return 100 - (100 / (1 + up/dn))
-
-def bollinger(df):
-    m = df["close"].rolling(20).mean()
-    s = df["close"].rolling(20).std()
-    df["upper"] = m + 1.5 * s
-    df["lower"] = m - 1.5 * s
-    return df
 
 def exchange_has_position():
     positions = exchange.fetch_positions()
@@ -103,39 +86,70 @@ def exchange_has_position():
             return True
     return False
 
-# ================= DAILY DD =====================
+# ================= DATA =================
+def fetch_df(symbol, limit=120):
+    df = pd.DataFrame(
+        exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit),
+        columns=["time", "open", "high", "low", "close", "volume"]
+    )
+    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(IST)
+    return df
+
+# ================= INDICATORS =================
+def rsi(series, period=14):
+    delta = series.diff()
+    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    down = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
+    return 100 - (100 / (1 + up / down))
+
+def bollinger(df):
+    mid = df["close"].rolling(20).mean()
+    std = df["close"].rolling(20).std()
+    df["upper"] = mid + 1.5 * std
+    df["lower"] = mid - 1.5 * std
+    return df
+
+# ================= RISK CONTROL =================
 def check_daily_dd():
     global TRADING_BLOCKED
-    bal = get_balance()
-    limit = DAY_START_BALANCE * (DAILY_DD_MODE / 100)
-    if DAY_START_BALANCE - bal >= limit:
+    balance = get_balance()
+    dd_limit = DAY_START_BALANCE * (DAILY_DD_MODE / 100)
+    if DAY_START_BALANCE - balance >= dd_limit:
         TRADING_BLOCKED = True
         log("🛑 DAILY DD HIT — Trading blocked till next day")
 
-# ================= ORDERS ======================
+# ================= ORDER FUNCTIONS =================
 def place_market(symbol, side, qty):
     exchange.set_leverage(LEVERAGE, symbol)
-    return exchange.create_market_buy_order(symbol, qty)
+    if side == "BUY":
+        return exchange.create_market_buy_order(symbol, qty)
+    else:
+        return exchange.create_market_sell_order(symbol, qty)
 
-def place_tp(symbol, side, price):
-    exchange.create_order(
+def place_tp(symbol, side, qty, price):
+    close_side = "sell" if side == "BUY" else "buy"
+    order = exchange.create_order(
         symbol=symbol,
-        type="TAKE_PROFIT_MARKET",
-        side="sell",
-        amount=None,
-        price=None,
+        type="limit",
+        side=close_side,
+        amount=qty,
+        price=price,
         params={
-            "stopPrice": price,
-            "closePosition": True,
-            "workingType": "MARK_PRICE"
+            "reduceOnly": True,
+            "timeInForce": "GTC"
         }
     )
-    log(f"🎯 TP placed @ {price}")
+    log(f"🎯 TP PLACED @ {price} | OrderID={order['id']}")
+    return order["id"]
 
 def close_position(symbol, qty):
-    exchange.create_market_sell_order(symbol, qty, {"reduceOnly": True})
+    exchange.create_market_sell_order(
+        symbol,
+        qty,
+        {"reduceOnly": True}
+    )
 
-# ================= MAIN LOOP ===================
+# ================= MAIN LOOP =================
 def run():
     global GLOBAL_IN_TRADE, CURRENT_TRADE
     global DAY_START_BALANCE, TRADING_BLOCKED
@@ -147,7 +161,7 @@ def run():
         try:
             now = datetime.now(IST)
 
-            # ---- Daily reset ----
+            # ---- Daily Reset ----
             if last_day != now.date():
                 DAY_START_BALANCE = get_balance()
                 TRADING_BLOCKED = False
@@ -159,12 +173,11 @@ def run():
                 time.sleep(10)
                 continue
 
-            # ========== MONITOR ==========
+            # ================= MONITOR =================
             if GLOBAL_IN_TRADE:
                 sym = CURRENT_TRADE["symbol"]
                 sl = CURRENT_TRADE["sl"]
                 qty = CURRENT_TRADE["qty"]
-
                 price = exchange.fetch_ticker(sym)["last"]
 
                 if price <= sl:
@@ -182,7 +195,7 @@ def run():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # ========== SCAN ==========
+            # ================= SCAN =================
             if exchange_has_position():
                 time.sleep(CHECK_INTERVAL)
                 continue
@@ -201,6 +214,7 @@ def run():
                 df["rsi"] = rsi(df["close"])
 
                 signal = None
+
                 if cfg["strategy"] == "BOLLINGER":
                     df = bollinger(df)
                     if df.iloc[-2]["low"] <= df.iloc[-2]["lower"]:
@@ -219,12 +233,8 @@ def run():
                 entry = df.iloc[-1]["open"]
                 qty = cfg["lot"]
 
-                if "tp_usdt" in cfg:
-                    tp = entry + cfg["tp_usdt"] / qty
-                    sl = entry - cfg["sl_usdt"] / qty
-                else:
-                    tp = entry + cfg["tp"]
-                    sl = entry - cfg["sl"]
+                tp = entry + cfg["tp"]
+                sl = entry - cfg["sl"]
 
                 margin = (entry * qty) / LEVERAGE
                 if get_balance() < margin:
@@ -235,16 +245,19 @@ def run():
                 time.sleep(1)
 
                 if not exchange_has_position():
-                    log("❌ Entry failed")
+                    log("❌ ENTRY FAILED")
                     continue
 
-                place_tp(symbol, "BUY", tp)
+                tp_id = place_tp(symbol, "BUY", qty, tp)
 
                 CURRENT_TRADE = {
                     "symbol": symbol,
+                    "side": "BUY",
                     "qty": qty,
-                    "sl": sl
+                    "sl": sl,
+                    "tp_id": tp_id
                 }
+
                 GLOBAL_IN_TRADE = True
                 break
 
@@ -255,7 +268,7 @@ def run():
             traceback.print_exc()
             time.sleep(5)
 
-# ================= START =====================
+# ================= START =================
 if __name__ == "__main__":
     log("🧪 FINAL TESTNET BOT STARTED")
     run()
