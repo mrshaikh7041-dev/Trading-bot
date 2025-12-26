@@ -1,274 +1,217 @@
 #!/usr/bin/env python3
-"""
-FINAL TESTNET LIVE-SAFE TRADING BOT
-Built strictly from UNIVERSAL BACKTEST logic
-"""
-
 import ccxt
-import pandas as pd
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
 
-# ================= USER CONFIG =================
-DAILY_DD_MODE = 50            # 25 or 50
-LEVERAGE = 75
-TIMEFRAME = "1m"
-CHECK_INTERVAL = 2
-COOLDOWN_MINUTES = 30
-
-IST = timezone(timedelta(hours=5, minutes=30))
-
+# ================= CONFIG =================
 API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
 API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
 
-# ================= EXCHANGE ===================
+TIMEFRAME = "1m"
+LEVERAGE = 75
+
+TP_USDT = 0.32
+SL_USDT = 0.16
+
+CHECK_INTERVAL = 2
+COOLDOWN_MINUTES = 30
+
+DAILY_DD_LIMITS = [0.50]   # evaluated separately if you want
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# ================= COINS CONFIG =================
+COINS = {
+    "BNB/USDT":  {"lot": 0.04, "side": "BUY",  "sessions": ["ASIA","LONDON"]},
+    "XRP/USDT":  {"lot": 15,   "side": "SELL", "sessions": ["ASIA"]},
+    "AVAX/USDT": {"lot": 1,    "side": "SELL", "sessions": ["ASIA","LONDON"]},
+    "SOL/USDT":  {"lot": 0.1,  "side": "BUY",  "sessions": ["ASIA","LONDON"]},
+}
+
+# ================= EXCHANGE =================
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "future"}
-})
-exchange.set_sandbox_mode(False)
-
-# ================= STRATEGY CONFIG =================
-COINS = {
-    "BNB/USDT": {
-        "strategy": "BOLLINGER",
-        "session": "ASIA",
-        "lot": 0.01,
-        "tp": 7.8,
-        "sl": 4.0
-    },
-    "AVAX/USDT": {
-        "strategy": "RSI",
-        "session": "LONDON",
-        "lot": 1,
-        "rsi_low": 10,
-        "tp": 0.32,
-        "sl": 0.16
-    },
-    "XRP/USDT": {
-        "strategy": "FIXED",
-        "session": "ASIA",
-        "lot": 15,
-        "tp": 0.022,
-        "sl": 0.011
+    "options": {
+        "defaultType": "future",
     }
-}
+})
 
-# ================= GLOBAL STATE =================
-GLOBAL_IN_TRADE = False
-CURRENT_TRADE = None
-DAY_START_BALANCE = None
-TRADING_BLOCKED = False
-COOLDOWN = {}
+exchange.set_sandbox_mode(True)
 
-# ================= UTILITIES =================
-def log(msg):
-    print(f"{datetime.now(IST)} | {msg}", flush=True)
+# ================= HELPERS =================
+def now_ist():
+    return datetime.now(IST)
 
-def in_session(ts, session):
-    hour = ts.hour
-    if session == "ASIA":
-        return 0 <= hour < 8
-    if session == "LONDON":
-        return 8 <= hour < 16
-    return False
+def get_session(ts):
+    h = ts.hour + ts.minute / 60
+    if 6 <= h < 13.5:
+        return "ASIA"
+    if 13.5 <= h < 18.5:
+        return "LONDON"
+    if 18.5 <= h < 23.5:
+        return "NY"
+    return None
 
 def get_balance():
-    return exchange.fetch_balance()["total"]["USDT"]
+    bal = exchange.fetch_balance()
+    return float(bal["USDT"]["free"])
 
-def exchange_has_position():
-    positions = exchange.fetch_positions()
+def set_leverage(symbol, lev):
+    try:
+        exchange.set_leverage(lev, symbol)
+    except:
+        pass
+
+def has_open_position(symbol):
+    positions = exchange.fetch_positions([symbol])
     for p in positions:
-        if abs(float(p.get("contracts", 0))) > 0:
+        if abs(float(p["contracts"])) > 0:
             return True
     return False
 
-# ================= DATA =================
-def fetch_df(symbol, limit=120):
-    df = pd.DataFrame(
-        exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit),
-        columns=["time", "open", "high", "low", "close", "volume"]
-    )
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(IST)
-    return df
+def cancel_all(symbol):
+    try:
+        exchange.cancel_all_orders(symbol)
+    except:
+        pass
 
-# ================= INDICATORS =================
-def rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    down = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
-    return 100 - (100 / (1 + up / down))
+def get_price(symbol):
+    return exchange.fetch_ticker(symbol)["last"]
 
-def bollinger(df):
-    mid = df["close"].rolling(20).mean()
-    std = df["close"].rolling(20).std()
-    df["upper"] = mid + 1.5 * std
-    df["lower"] = mid - 1.5 * std
-    return df
-
-# ================= RISK CONTROL =================
-def check_daily_dd():
-    global TRADING_BLOCKED
-    balance = get_balance()
-    dd_limit = DAY_START_BALANCE * (DAILY_DD_MODE / 100)
-    if DAY_START_BALANCE - balance >= dd_limit:
-        TRADING_BLOCKED = True
-        log("🛑 DAILY DD HIT — Trading blocked till next day")
-
-# ================= ORDER FUNCTIONS =================
-def place_market(symbol, side, qty):
-    exchange.set_leverage(LEVERAGE, symbol)
+# ================= TP / SL PLACEMENT =================
+def place_tp_sl(symbol, side, qty, entry):
     if side == "BUY":
-        return exchange.create_market_buy_order(symbol, qty)
+        tp = entry + TP_USDT / qty
+        sl = entry - SL_USDT / qty
+        tp_side = "sell"
+        sl_side = "sell"
     else:
-        return exchange.create_market_sell_order(symbol, qty)
+        tp = entry - TP_USDT / qty
+        sl = entry + SL_USDT / qty
+        tp_side = "buy"
+        sl_side = "buy"
 
-def place_tp(symbol, side, qty, price):
-    close_side = "sell" if side == "BUY" else "buy"
-    order = exchange.create_order(
+    # TAKE PROFIT (LIMIT REDUCE ONLY)
+    exchange.create_order(
         symbol=symbol,
         type="limit",
-        side=close_side,
+        side=tp_side,
         amount=qty,
-        price=price,
+        price=round(tp, 6),
+        params={"reduceOnly": True}
+    )
+
+    # STOP LOSS (STOP MARKET REDUCE ONLY)
+    exchange.create_order(
+        symbol=symbol,
+        type="stop_market",
+        side=sl_side,
+        amount=qty,
         params={
-            "reduceOnly": True,
-            "timeInForce": "GTC"
+            "stopPrice": round(sl, 6),
+            "reduceOnly": True
         }
     )
-    log(f"🎯 TP PLACED @ {price} | OrderID={order['id']}")
-    return order["id"]
 
-def close_position(symbol, qty):
-    exchange.create_market_sell_order(
-        symbol,
-        qty,
-        {"reduceOnly": True}
-    )
+# ================= MAIN =================
+def main():
+    print("\n🔥 TESTNET BOT STARTED")
+    print("Time:", now_ist())
 
-# ================= MAIN LOOP =================
-def run():
-    global GLOBAL_IN_TRADE, CURRENT_TRADE
-    global DAY_START_BALANCE, TRADING_BLOCKED
+    balance = get_balance()
+    print("Starting Balance:", balance)
 
-    last_day = None
-    log(f"Connected | Balance: {get_balance()}")
+    start_of_day = datetime.now(IST).date()
+    day_start_balance = balance
+    blocked_today = False
+
+    for sym in COINS:
+        set_leverage(sym, LEVERAGE)
+
+    cooldown = {c: None for c in COINS}
 
     while True:
         try:
-            now = datetime.now(IST)
+            now = now_ist()
 
-            # ---- Daily Reset ----
-            if last_day != now.date():
-                DAY_START_BALANCE = get_balance()
-                TRADING_BLOCKED = False
-                last_day = now.date()
-                log(f"🔄 New Day | Balance: {DAY_START_BALANCE}")
+            # reset daily DD
+            if now.date() != start_of_day:
+                start_of_day = now.date()
+                day_start_balance = get_balance()
+                blocked_today = False
 
-            check_daily_dd()
-            if TRADING_BLOCKED:
-                time.sleep(10)
-                continue
-
-            # ================= MONITOR =================
-            if GLOBAL_IN_TRADE:
-                sym = CURRENT_TRADE["symbol"]
-                sl = CURRENT_TRADE["sl"]
-                qty = CURRENT_TRADE["qty"]
-                price = exchange.fetch_ticker(sym)["last"]
-
-                if price <= sl:
-                    log(f"❌ SL HIT {sym}")
-                    close_position(sym, qty)
-                    COOLDOWN[sym] = now + timedelta(minutes=COOLDOWN_MINUTES)
-                    GLOBAL_IN_TRADE = False
-                    CURRENT_TRADE = None
-
-                elif not exchange_has_position():
-                    log(f"✅ TP HIT {sym}")
-                    GLOBAL_IN_TRADE = False
-                    CURRENT_TRADE = None
-
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            # ================= SCAN =================
-            if exchange_has_position():
-                time.sleep(CHECK_INTERVAL)
+            if blocked_today:
+                time.sleep(5)
                 continue
 
             for symbol, cfg in COINS.items():
-                if GLOBAL_IN_TRADE:
-                    break
-
-                if symbol in COOLDOWN and now < COOLDOWN[symbol]:
+                session = get_session(now)
+                if session not in cfg["sessions"]:
                     continue
 
-                if not in_session(now, cfg["session"]):
+                if cooldown[symbol] and now < cooldown[symbol]:
                     continue
 
-                df = fetch_df(symbol)
-                df["rsi"] = rsi(df["close"])
-
-                signal = None
-
-                if cfg["strategy"] == "BOLLINGER":
-                    df = bollinger(df)
-                    if df.iloc[-2]["low"] <= df.iloc[-2]["lower"]:
-                        signal = "BUY"
-
-                elif cfg["strategy"] == "RSI":
-                    if df.iloc[-3]["rsi"] < cfg["rsi_low"] and df.iloc[-2]["rsi"] > cfg["rsi_low"]:
-                        signal = "BUY"
-
-                elif cfg["strategy"] == "FIXED":
-                    signal = "BUY"
-
-                if not signal:
+                if has_open_position(symbol):
                     continue
 
-                entry = df.iloc[-1]["open"]
+                balance = get_balance()
+                if balance <= 0:
+                    print("❌ Balance zero. Stopping bot.")
+                    return
+
+                # daily DD
+                if (day_start_balance - balance) >= day_start_balance * 0.5:
+                    print("⚠️ Daily DD hit. Trading paused.")
+                    blocked_today = True
+                    continue
+
+                # fetch candles
+                ohlc = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=25)
+                closes = [c[4] for c in ohlc]
+                lows = [c[3] for c in ohlc]
+                highs = [c[2] for c in ohlc]
+
+                import numpy as np
+                mid = np.mean(closes[-20:])
+                std = np.std(closes[-20:])
+                upper = mid + 1.5 * std
+                lower = mid - 1.5 * std
+
+                side = cfg["side"]
+
+                # ENTRY CONDITION
+                if side == "BUY" and lows[-1] > lower:
+                    continue
+                if side == "SELL" and highs[-1] < upper:
+                    continue
+
+                price = get_price(symbol)
                 qty = cfg["lot"]
 
-                tp = entry + cfg["tp"]
-                sl = entry - cfg["sl"]
+                print(f"📌 ENTRY {symbol} {side} @ {price}")
 
-                margin = (entry * qty) / LEVERAGE
-                if get_balance() < margin:
-                    continue
+                order = exchange.create_market_order(
+                    symbol,
+                    "buy" if side == "BUY" else "sell",
+                    qty
+                )
 
-                log(f"🚀 ENTRY {symbol}")
-                place_market(symbol, "BUY", qty)
-                time.sleep(1)
+                avg_price = order["average"] or price
 
-                if not exchange_has_position():
-                    log("❌ ENTRY FAILED")
-                    continue
+                place_tp_sl(symbol, side, qty, avg_price)
 
-                tp_id = place_tp(symbol, "BUY", qty, tp)
-
-                CURRENT_TRADE = {
-                    "symbol": symbol,
-                    "side": "BUY",
-                    "qty": qty,
-                    "sl": sl,
-                    "tp_id": tp_id
-                }
-
-                GLOBAL_IN_TRADE = True
-                break
+                cooldown[symbol] = now + timedelta(minutes=COOLDOWN_MINUTES)
 
             time.sleep(CHECK_INTERVAL)
 
-        except Exception:
-            log("⚠️ ERROR — continuing")
-            traceback.print_exc()
+        except Exception as e:
+            print("ERROR:", e)
             time.sleep(5)
 
-# ================= START =================
+
 if __name__ == "__main__":
-    log("🧪 FINAL TESTNET BOT STARTED")
-    run()
+    main()
