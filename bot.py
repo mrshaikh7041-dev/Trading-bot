@@ -5,8 +5,8 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 # ================= CONFIG =================
-API_KEY = "arAhB8UfHnvJ0Z3u9Yigz0vgiRO3m6o4je5XKpcmgWYHdPMPgMFguqe8GyVjSTCq"
-API_SECRET = "hXHMjP2xER40XZ1kS64FwrZEmwzDIPLRQmZPbhlt5gEqCdhKRf25yzfE0Zi4BStn"
+API_KEY = "czpG6usnSKOVK5WHcW71y9ldXpDkBGvotp1omrydhsxegPDossHMklFLeiEEZtcJ"
+API_SECRET = "cZuTDhXFMxqOc18OmMKhn4WizIjC8csrDZkfpuUUyASDXwk4l5o3FV36HBz5u2rO"
 
 TIMEFRAME = "1m"
 LEVERAGE = 75
@@ -17,7 +17,7 @@ SL_USDT = 0.16
 CHECK_INTERVAL = 2
 COOLDOWN_MINUTES = 30
 
-DAILY_DD_LIMITS = [0.50]   # evaluated separately if you want
+DAILY_DD_LIMITS = [1.0]   # evaluated separately if you want
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -39,7 +39,7 @@ exchange = ccxt.binance({
     }
 })
 
-exchange.set_sandbox_mode(True)
+exchange.set_sandbox_mode(False)
 
 # ================= HELPERS =================
 def now_ist():
