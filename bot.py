@@ -1,34 +1,33 @@
 #!/usr/bin/env python3
-import ccxt
-import time
-import logging
-import random
+import ccxt, time, random, traceback
 from datetime import datetime, timedelta, timezone
 
 # ===================== MODE =====================
-MODE = "SIM"   # "SIM" or "LIVE"
+MODE = "SIM"      # "SIM" or "LIVE"
 
-# ================= CONFIG =================
+# ===================== API ======================
 API_KEY = ""
 API_SECRET = ""
 
+# ===================== SETTINGS =================
 TIMEFRAME = "1m"
 LEVERAGE = 75
+CHECK_INTERVAL = 2
 
 TP_USDT = 0.32
 SL_USDT = 0.16
 
-CHECK_INTERVAL = 2
+SIM_START_BALANCE = 3.0
+
+DAILY_DD_LIMIT = 0.50
 COOLDOWN_MINUTES = 30
 
-DAILY_DD_LIMIT = 0.50   # 50%
-
-FEE_RATE = 0.0012
 SLIPPAGE_RANGE = (0.0002, 0.0008)
+EXEC_DELAY = (1, 3)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ================= COINS =================
+# ===================== COINS ====================
 COINS = {
     "BNB/USDT":  {"lot": 0.04, "side": "BUY",  "sessions": ["ASIA","LONDON"]},
     "XRP/USDT":  {"lot": 15,   "side": "SELL", "sessions": ["ASIA"]},
@@ -36,42 +35,33 @@ COINS = {
     "SOL/USDT":  {"lot": 0.1,  "side": "BUY",  "sessions": ["ASIA","LONDON"]},
 }
 
-# ================= LOGGING =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
-)
-log = logging.getLogger()
-
-# ================= EXCHANGE =================
+# ===================== EXCHANGE =================
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
-    "options": {"defaultType": "future"}
+    "options": {"defaultType": "future"},
 })
 
 if MODE == "SIM":
     exchange.set_sandbox_mode(True)
 
-# ================= HELPERS =================
-def now_ist():
+# ===================== HELPERS ==================
+def now():
     return datetime.now(IST)
 
-def get_session(ts):
-    h = ts.hour + ts.minute / 60
+def log(msg):
+    print(f"{now()} | {msg}", flush=True)
+
+def get_session(t):
+    h = t.hour + t.minute / 60
     if 6 <= h < 13.5: return "ASIA"
     if 13.5 <= h < 18.5: return "LONDON"
     if 18.5 <= h < 23.5: return "NY"
     return None
 
-def get_balance():
-    bal = exchange.fetch_balance()
-    return float(bal["USDT"]["free"])
+def get_price(symbol):
+    return exchange.fetch_ticker(symbol)["last"]
 
 def set_leverage(symbol):
     try:
@@ -79,209 +69,186 @@ def set_leverage(symbol):
     except:
         pass
 
-def has_position(symbol):
-    pos = exchange.fetch_positions([symbol])
-    for p in pos:
-        if abs(float(p.get("contracts", 0))) > 0:
-            return True
-    return False
+def fetch_candles(symbol):
+    return exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=25)
 
-def get_price(symbol):
-    return exchange.fetch_ticker(symbol)["last"]
+def get_balance():
+    global sim_balance
+    if MODE == "SIM":
+        return sim_balance
+    bal = exchange.fetch_balance()
+    return float(bal["USDT"]["free"])
 
-# ================= TP / SL =================
-def place_tp_sl(symbol, side, qty, entry):
+# ===================== ENTRY FILTER =====================
+def bollinger_signal(ohlc, side):
+    closes = [c[4] for c in ohlc]
+    highs  = [c[2] for c in ohlc]
+    lows   = [c[3] for c in ohlc]
+
+    mid = sum(closes[-20:]) / 20
+    std = (sum([(x - mid) ** 2 for x in closes[-20:]]) / 20) ** 0.5
+
+    upper = mid + 1.5 * std
+    lower = mid - 1.5 * std
+
     if side == "BUY":
-        tp = entry + TP_USDT / qty
-        sl = entry - SL_USDT / qty
-        close_side = "sell"
+        return lows[-1] <= lower
     else:
-        tp = entry - TP_USDT / qty
-        sl = entry + SL_USDT / qty
-        close_side = "buy"
-
-    if MODE == "LIVE":
-        exchange.create_order(
-            symbol=symbol,
-            type="limit",
-            side=close_side,
-            amount=qty,
-            price=round(tp, 6),
-            params={"reduceOnly": True}
-        )
-
-        exchange.create_order(
-            symbol=symbol,
-            type="stop_market",
-            side=close_side,
-            amount=qty,
-            params={
-                "stopPrice": round(sl, 6),
-                "reduceOnly": True
-            }
-        )
-
-    return tp, sl
+        return highs[-1] >= upper
 
 
-# ================= MAIN =================
+# ===================== BOT-SIDE SL EXEC =====================
+def check_sl_hit(side, price, sl):
+    if side == "BUY":
+        return price <= sl
+    else:
+        return price >= sl
+
+
+# ===================== TP ORDER =====================
+def place_tp(symbol, side, qty, tp):
+    if MODE == "SIM":
+        return
+
+    tp_side = "sell" if side == "BUY" else "buy"
+
+    exchange.create_order(
+        symbol=symbol,
+        type="limit",
+        side=tp_side,
+        amount=qty,
+        price=round(tp, 6),
+        params={"reduceOnly": True}
+    )
+
+
+# ===================== MAIN =====================
 def main():
-    log.info("===================================")
-    log.info("BOT STARTED")
-    log.info(f"MODE = {MODE}")
-    log.info(f"START BALANCE = {get_balance():.4f}")
-    log.info("===================================")
+    global sim_balance
+
+    log("🔥 BOT STARTED")
+    log(f"MODE = {MODE}")
+
+    if MODE == "SIM":
+        sim_balance = SIM_START_BALANCE
+        log(f"SIM BALANCE = {sim_balance}")
+    else:
+        log(f"LIVE BALANCE = {get_balance()}")
 
     for s in COINS:
         set_leverage(s)
 
-    cooldown = {c: None for c in COINS}
-    open_trade = {c: None for c in COINS}
+    cooldown = {s: None for s in COINS}
+    open_pos = {s: False for s in COINS}
 
-    start_day = now_ist().date()
+    day_start = now().date()
     day_start_balance = get_balance()
     blocked_today = False
 
     while True:
         try:
-            now = now_ist()
+            now_t = now()
 
-            # new day reset
-            if now.date() != start_day:
-                start_day = now.date()
+            if now_t.date() != day_start:
+                day_start = now_t.date()
                 day_start_balance = get_balance()
                 blocked_today = False
-                log.info("🔄 New Day Started")
-
-            if blocked_today:
-                time.sleep(5)
-                continue
+                log("🔄 New trading day started")
 
             for symbol, cfg in COINS.items():
 
-                if cooldown[symbol] and now < cooldown[symbol]:
+                if blocked_today:
                     continue
 
-                session = get_session(now)
+                session = get_session(now_t)
                 if session not in cfg["sessions"]:
                     continue
 
-                if open_trade[symbol]:
+                if open_pos[symbol]:
                     continue
 
-                if has_position(symbol):
+                if cooldown[symbol] and now_t < cooldown[symbol]:
                     continue
 
                 balance = get_balance()
                 if balance <= 0:
-                    log.error("BALANCE ZERO — STOPPING BOT")
+                    log("❌ Balance zero — stopping bot")
                     return
 
                 if (day_start_balance - balance) >= day_start_balance * DAILY_DD_LIMIT:
-                    log.warning(
-                        f"DAILY DD HIT | Start={day_start_balance:.2f} Now={balance:.2f}"
-                    )
+                    log("🚫 DAILY DD HIT → Trading paused")
                     blocked_today = True
                     continue
 
-                # ---- fetch candles ----
-                candles = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=25)
-                closes = [c[4] for c in candles]
-                highs = [c[2] for c in candles]
-                lows = [c[3] for c in candles]
-
-                mid = sum(closes[-20:]) / 20
-                std = (sum([(x - mid) ** 2 for x in closes[-20:]]) / 20) ** 0.5
-                upper = mid + 1.5 * std
-                lower = mid - 1.5 * std
+                ohlc = fetch_candles(symbol)
+                if len(ohlc) < 25:
+                    continue
 
                 side = cfg["side"]
+                if not bollinger_signal(ohlc, side):
+                    continue
 
-                # entry condition
-                if side == "BUY" and lows[-1] > lower:
-                    continue
-                if side == "SELL" and highs[-1] < upper:
-                    continue
+                time.sleep(random.randint(*EXEC_DELAY))
 
                 price = get_price(symbol)
-                qty = cfg["lot"]
-
-                # simulate slippage
                 price *= 1 + random.uniform(*SLIPPAGE_RANGE)
 
-                log.info(
-                    f"ENTRY → {symbol} | SIDE={side} | PRICE={price:.5f} | QTY={qty}"
-                )
+                qty = cfg["lot"]
 
                 if MODE == "LIVE":
-                    order = exchange.create_market_order(
+                    exchange.create_market_order(
                         symbol,
                         "buy" if side == "BUY" else "sell",
                         qty
                     )
-                    entry_price = order["average"] or price
-                else:
-                    entry_price = price
 
-                tp, sl = place_tp_sl(symbol, side, qty, entry_price)
+                entry = price
+                tp = entry + TP_USDT / qty if side == "BUY" else entry - TP_USDT / qty
+                sl = entry - SL_USDT / qty if side == "BUY" else entry + SL_USDT / qty
 
-                log.info(
-                    f"TP={tp:.5f} | SL={sl:.5f}"
-                )
+                log(f"📌 ENTRY {symbol} {side} @ {entry:.4f}")
+                log(f"   TP={tp:.4f} | SL={sl:.4f}")
 
-                open_trade[symbol] = {
-                    "side": side,
-                    "entry": entry_price,
-                    "qty": qty,
-                    "tp": tp,
-                    "sl": sl
-                }
+                if MODE == "LIVE":
+                    place_tp(symbol, side, qty, tp)
 
-            # ===== MONITOR POSITIONS =====
-            for symbol, pos in list(open_trade.items()):
-                if not pos:
-                    continue
+                open_pos[symbol] = True
 
-                price = get_price(symbol)
-                side = pos["side"]
+                # ===== monitor position =====
+                while True:
+                    price_now = get_price(symbol)
 
-                hit = None
-                if side == "BUY":
-                    if price <= pos["sl"]:
-                        hit = "SL"
-                    elif price >= pos["tp"]:
-                        hit = "TP"
-                else:
-                    if price >= pos["sl"]:
-                        hit = "SL"
-                    elif price <= pos["tp"]:
-                        hit = "TP"
+                    # SL check (BOT SIDE)
+                    if check_sl_hit(side, price_now, sl):
+                        pnl = (price_now - entry) * qty if side == "BUY" else (entry - price_now) * qty
+                        pnl -= entry * qty * 0.0012
 
-                if hit:
-                    pnl = (
-                        (price - pos["entry"]) * pos["qty"]
-                        if side == "BUY"
-                        else (pos["entry"] - price) * pos["qty"]
-                    )
-                    pnl -= pos["entry"] * pos["qty"] * FEE_RATE
+                        if MODE == "SIM":
+                            sim_balance += pnl
 
-                    balance = get_balance() if MODE == "LIVE" else balance + pnl
+                        log(f"❌ SL HIT {symbol} | PNL={pnl:.4f} | BAL={get_balance():.4f}")
 
-                    log.info(
-                        f"EXIT → {symbol} | {hit} HIT | "
-                        f"ENTRY={pos['entry']:.5f} EXIT={price:.5f} "
-                        f"PNL={pnl:.4f} BAL={balance:.4f}"
-                    )
+                        cooldown[symbol] = now() + timedelta(minutes=COOLDOWN_MINUTES)
+                        open_pos[symbol] = False
+                        break
 
-                    if hit == "SL":
-                        cooldown[symbol] = now + timedelta(minutes=COOLDOWN_MINUTES)
+                    # TP handled by exchange (LIVE)
+                    if MODE == "SIM":
+                        if (side == "BUY" and price_now >= tp) or (side == "SELL" and price_now <= tp):
+                            pnl = (tp - entry) * qty if side == "BUY" else (entry - tp) * qty
+                            pnl -= entry * qty * 0.0012
+                            sim_balance += pnl
 
-                    open_trade[symbol] = None
+                            log(f"✅ TP HIT {symbol} | PNL={pnl:.4f} | BAL={get_balance():.4f}")
+                            open_pos[symbol] = False
+                            break
+
+                    time.sleep(1)
 
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            log.error(f"ERROR → {e}")
+            log(f"ERROR: {e}")
             time.sleep(5)
 
 
