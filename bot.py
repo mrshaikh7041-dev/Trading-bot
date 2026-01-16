@@ -2,17 +2,14 @@
 import ccxt, time
 from datetime import datetime, timedelta, timezone
 
-# ================= MODE =================
-MODE = "SIM"   # SIM or LIVE
+MODE = "SIM"
 
-# ================= API ==================
 API_KEY = ""
 API_SECRET = ""
 
-# ================= SETTINGS =================
 TIMEFRAME = "1m"
 LEVERAGE = 75
-CHECK_INTERVAL = 3
+CHECK_INTERVAL = 2
 
 TP_USDT = 0.32
 SL_USDT = 0.16
@@ -24,24 +21,23 @@ FEE_RATE = 0.0012
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ================= COINS =================
 COINS = {
-    "BNB/USDT":  {"lot": 0.04, "side": "BUY",  "sessions": ["ASIA","LONDON"]},
-    "XRP/USDT":  {"lot": 15,   "side": "SELL", "sessions": ["ASIA"]},
-    "AVAX/USDT": {"lot": 1,    "side": "SELL", "sessions": ["ASIA","LONDON"]},
-    "SOL/USDT":  {"lot": 0.1,  "side": "BUY",  "sessions": ["ASIA","LONDON"]},
+    "BNB/USDT":  {"lot": 0.04, "sessions": ["ASIA","LONDON"]},
+    "XRP/USDT":  {"lot": 15,   "sessions": ["ASIA"]},
+    "AVAX/USDT": {"lot": 1,    "sessions": ["ASIA","LONDON"]},
+    "SOL/USDT":  {"lot": 0.1,  "sessions": ["ASIA","LONDON"]},
 }
 
-# ================= EXCHANGE =================
 exchange = ccxt.binance({
     "apiKey": API_KEY,
     "secret": API_SECRET,
     "enableRateLimit": True,
     "options": {"defaultType": "future"}
 })
-# ❌ NO sandbox / testnet
 
-# ================= UTILS =================
+if MODE == "SIM":
+    exchange.set_sandbox_mode(True)
+
 def now():
     return datetime.now(IST)
 
@@ -61,20 +57,26 @@ def fetch_price(symbol):
 def fetch_ohlc(symbol):
     return exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=25)
 
-# ================= BOLLINGER =================
-def bollinger_signal(ohlc, side):
+# ===== NEW DIRECTION LOGIC =====
+def bollinger_signal_direction(ohlc):
     closes = [x[4] for x in ohlc]
     highs  = [x[2] for x in ohlc]
     lows   = [x[3] for x in ohlc]
 
     mid = sum(closes[-20:]) / 20
     std = (sum((c - mid) ** 2 for c in closes[-20:]) / 20) ** 0.5
+
     upper = mid + 1.5 * std
     lower = mid - 1.5 * std
 
-    return lows[-1] <= lower if side == "BUY" else highs[-1] >= upper
+    if lows[-1] <= lower:
+        return "BUY"
+    if highs[-1] >= upper:
+        return "SELL"
 
-# ================= MAIN =================
+    return None
+
+
 def main():
     sim_balance = SIM_START_BALANCE
     positions = {}
@@ -86,22 +88,21 @@ def main():
 
     log("🔥 BOT STARTED")
     log(f"MODE = {MODE}")
-    log(f"START BALANCE = {sim_balance}")
+    log(f"START BAL = {sim_balance}")
 
     while True:
         try:
             t = now()
 
-            # ===== New Day Reset =====
             if t.date() != day:
                 day = t.date()
                 day_start_balance = sim_balance
                 blocked_today = False
-                log("🔄 NEW TRADING DAY")
+                log("🔄 NEW DAY")
 
             for symbol, cfg in COINS.items():
 
-                # ===== MANAGE OPEN POSITION =====
+                # ---- manage open positions ----
                 if symbol in positions:
                     pos = positions[symbol]
                     price = fetch_price(symbol)
@@ -110,13 +111,12 @@ def main():
                     hit_sl = price <= pos["sl"] if pos["side"] == "BUY" else price >= pos["sl"]
 
                     if hit_tp or hit_sl:
-                        exit_price = pos["tp"] if hit_tp else pos["sl"]
-
                         pnl = (
-                            (exit_price - pos["entry"]) * pos["qty"]
-                            if pos["side"] == "BUY"
-                            else (pos["entry"] - exit_price) * pos["qty"]
+                            (pos["tp"] - pos["entry"]) * pos["qty"]
+                            if hit_tp else
+                            (pos["sl"] - pos["entry"]) * pos["qty"]
                         )
+
                         pnl -= pos["entry"] * pos["qty"] * FEE_RATE
                         sim_balance += pnl
 
@@ -125,23 +125,32 @@ def main():
                         del positions[symbol]
                         cooldown[symbol] = t + timedelta(minutes=COOLDOWN_MINUTES)
 
-                        # DAILY DD CHECK (AFTER CLOSE)
                         if (day_start_balance - sim_balance) >= day_start_balance * DAILY_DD_LIMIT:
                             blocked_today = True
-                            log("🚫 DAILY DD HIT → NEW ENTRIES BLOCKED")
+                            log("🚫 DAILY DD HIT")
 
-                # ===== ENTRY CHECK =====
+                # ---- entry logic ----
                 else:
-                    if blocked_today: continue
-                    if symbol in cooldown and t < cooldown[symbol]: continue
-                    if get_session(t) not in cfg["sessions"]: continue
+                    if blocked_today:
+                        continue
+
+                    if symbol in cooldown and t < cooldown[symbol]:
+                        continue
+
+                    if get_session(t) not in cfg["sessions"]:
+                        continue
 
                     ohlc = fetch_ohlc(symbol)
-                    if not bollinger_signal(ohlc, cfg["side"]): continue
+                    if len(ohlc) < 25:
+                        continue
+
+                    side = bollinger_signal_direction(ohlc)
+
+                    if side is None:
+                        continue
 
                     price = fetch_price(symbol)
                     qty = cfg["lot"]
-                    side = cfg["side"]
 
                     entry = price
                     tp = entry + TP_USDT / qty if side == "BUY" else entry - TP_USDT / qty
@@ -162,6 +171,7 @@ def main():
         except Exception as e:
             log("ERROR: " + str(e))
             time.sleep(5)
+
 
 if __name__ == "__main__":
     main()
