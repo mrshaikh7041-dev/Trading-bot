@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import ccxt, time, random
+import ccxt, time
 from datetime import datetime, timedelta, timezone
 
 # ================= MODE =================
@@ -56,23 +56,15 @@ def fetch_price(symbol):
     return exchange.fetch_ticker(symbol)["last"]
 
 def fetch_ohlc(symbol):
-    return exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=50)
+    return exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=250)
 
-# ================= INDICATORS =================
-def bollinger(df):
-    closes = [x[4] for x in df]
-    ma = sum(closes[-20:]) / 20
-    std = (sum((c - ma) ** 2 for c in closes[-20:]) / 20) ** 0.5
-    return ma + 1.5 * std, ma - 1.5 * std
-
-def atr(df, period=14):
-    trs = []
-    for i in range(-period, 0):
-        h = df[i][2]
-        l = df[i][3]
-        pc = df[i-1][4]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
-    return sum(trs) / len(trs)
+# ================= EMA =================
+def ema(values, period):
+    k = 2 / (period + 1)
+    ema_val = values[0]
+    for v in values[1:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
 
 # ================= MAIN =================
 def main():
@@ -94,7 +86,7 @@ def main():
         try:
             t = now()
 
-            # daily reset
+            # ===== DAILY RESET =====
             if t.date() != day:
                 day = t.date()
                 day_start_balance = sim_balance
@@ -140,7 +132,6 @@ def main():
                     if (day_start_balance - sim_balance) >= day_start_balance * DAILY_DD_LIMIT:
                         blocked_today = True
                         log("🚫 DAILY DD HIT")
-                    continue
 
             # ===== ENTRY CHECK =====
             if blocked_today:
@@ -153,35 +144,29 @@ def main():
                 if symbol in cooldown and t < cooldown[symbol]:
                     continue
 
-                # skip noisy first 3 minutes of every 15
-                if t.minute % 15 < 3:
-                    continue
-
                 ohlc = fetch_ohlc(symbol)
-                if len(ohlc) < 30:
+                if len(ohlc) < 210:
                     continue
 
-                upper, lower = bollinger(ohlc)
-                atr_val = atr(ohlc)
+                closes = [x[4] for x in ohlc]
 
-                lot = cfg["lot"]
-                sl_range = SL_USDT / lot
-
-                # volatility filter
-                if atr_val < sl_range:
-                    continue
-
-                close = ohlc[-1][4]
+                ema9   = ema(closes[-50:], 9)
+                ema21  = ema(closes[-50:], 21)
+                ema200 = ema(closes[-210:], 200)
 
                 side = None
-                if close < lower:
+                price = closes[-1]
+
+                if ema9 > ema21 and price > ema200:
                     side = "BUY"
-                elif close > upper:
+                elif ema9 < ema21 and price < ema200:
                     side = "SELL"
                 else:
                     continue
 
                 entry = fetch_price(symbol)
+                lot = cfg["lot"]
+
                 tp = entry + TP_USDT / lot if side == "BUY" else entry - TP_USDT / lot
                 sl = entry - SL_USDT / lot if side == "BUY" else entry + SL_USDT / lot
 
