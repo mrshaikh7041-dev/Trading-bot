@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import ccxt, time
+import ccxt, time, traceback
+import pandas as pd
 from datetime import datetime, timedelta, timezone
 
 # ================= MODE =================
-MODE = "SIM"   # "SIM" or "LIVE"
+MODE = "SIM"    # "SIM" or "LIVE"
 
 # ================= API ==================
 API_KEY = ""
@@ -12,18 +13,16 @@ API_SECRET = ""
 # ================= SETTINGS =================
 TIMEFRAME = "1m"
 CHECK_INTERVAL = 2
-LEVERAGE = 75
 
 TP_USDT = 0.32
 SL_USDT = 0.16
 
-SIM_START_BALANCE = 10.0
+SIM_START_BALANCE = 3.0
 DAILY_DD_LIMIT = 0.50
-COOLDOWN_MINUTES = 30
-LOSS_PAUSE_MIN = 60
-MAX_LOSS_STREAK = 2
 
+COOLDOWN_MINUTES = 30
 FEE_RATE = 0.0012
+
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # ================= COINS =================
@@ -42,8 +41,14 @@ exchange = ccxt.binance({
     "options": {"defaultType": "future"}
 })
 
-if MODE == "SIM":
-    exchange.set_sandbox_mode(True)
+# ================= GLOBAL STATE =================
+sim_balance = SIM_START_BALANCE
+positions = {}
+cooldown = {}
+
+day = None
+day_start_balance = SIM_START_BALANCE
+blocked_today = False
 
 # ================= UTILS =================
 def now():
@@ -52,139 +57,212 @@ def now():
 def log(msg):
     print(f"{now()} | {msg}", flush=True)
 
-def fetch_price(symbol):
-    return exchange.fetch_ticker(symbol)["last"]
+def get_balance():
+    global sim_balance
+    if MODE == "SIM":
+        return sim_balance
+    bal = exchange.fetch_balance()
+    return float(bal["USDT"]["free"])
 
+# ================= DATA =================
 def fetch_ohlc(symbol):
-    return exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=250)
+    ohlc = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=210)
+    df = pd.DataFrame(
+        ohlc,
+        columns=["time","open","high","low","close","volume"]
+    )
+    return df
 
-# ================= EMA =================
-def ema(values, period):
-    k = 2 / (period + 1)
-    ema_val = values[0]
-    for v in values[1:]:
-        ema_val = v * k + ema_val * (1 - k)
-    return ema_val
+# ================= EMA SIGNAL =================
+def ema_signal(df):
+
+    df["ema9"] = df["close"].ewm(span=9).mean()
+    df["ema21"] = df["close"].ewm(span=21).mean()
+    df["ema200"] = df["close"].ewm(span=200).mean()
+
+    i = len(df) - 1
+
+    prev9 = df["ema9"].iloc[i-1]
+    prev21 = df["ema21"].iloc[i-1]
+
+    curr9 = df["ema9"].iloc[i]
+    curr21 = df["ema21"].iloc[i]
+
+    price = df["close"].iloc[i]
+    ema200 = df["ema200"].iloc[i]
+
+    # crossover logic
+    if price > ema200 and prev9 <= prev21 and curr9 > curr21:
+        return "BUY"
+
+    if price < ema200 and prev9 >= prev21 and curr9 < curr21:
+        return "SELL"
+
+    return None
+
+# ================= TP PLACE =================
+def place_tp(symbol, side, qty, tp):
+
+    if MODE != "LIVE":
+        return
+
+    exchange.create_order(
+        symbol=symbol,
+        type="limit",
+        side="sell" if side=="BUY" else "buy",
+        amount=qty,
+        price=round(tp,6),
+        params={"reduceOnly": True}
+    )
+
+# ================= ENTRY =================
+def open_trade(symbol, side, entry):
+
+    global sim_balance
+
+    qty = COINS[symbol]["lot"]
+
+    tp = entry + TP_USDT/qty if side=="BUY" else entry - TP_USDT/qty
+    sl = entry - SL_USDT/qty if side=="BUY" else entry + SL_USDT/qty
+
+    if MODE == "LIVE":
+
+        exchange.create_market_order(
+            symbol,
+            "buy" if side=="BUY" else "sell",
+            qty
+        )
+
+        place_tp(symbol, side, qty, tp)
+
+    positions[symbol] = {
+        "side": side,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "qty": qty
+    }
+
+    log(f"ENTRY {symbol} {side} @ {entry:.4f}")
+    log(f"TP={tp:.4f} SL={sl:.4f}")
+
+# ================= EXIT =================
+def close_trade(symbol, price, reason):
+
+    global sim_balance
+
+    pos = positions[symbol]
+
+    if reason=="TP":
+        exit_price = pos["tp"]
+    else:
+        exit_price = pos["sl"]
+
+    pnl = (
+        (exit_price - pos["entry"]) * pos["qty"]
+        if pos["side"]=="BUY"
+        else (pos["entry"] - exit_price) * pos["qty"]
+    )
+
+    pnl -= pos["entry"] * pos["qty"] * FEE_RATE
+
+    if MODE=="SIM":
+        sim_balance += pnl
+
+    log(f"{reason} {symbol} PNL={pnl:.4f} BAL={get_balance():.4f}")
+
+    del positions[symbol]
+
+    if reason=="SL":
+        cooldown[symbol] = now() + timedelta(minutes=COOLDOWN_MINUTES)
 
 # ================= MAIN =================
 def main():
-    sim_balance = SIM_START_BALANCE
-    positions = {}
-    cooldown = {}
-    loss_streak = 0
-    pause_until = None
 
-    day = now().date()
-    day_start_balance = sim_balance
-    blocked_today = False
+    global day, day_start_balance, blocked_today
 
-    log("🔥 BOT STARTED")
-    log(f"MODE = {MODE}")
-    log(f"START BAL = {sim_balance}")
+    log("BOT STARTED")
+    log(f"MODE={MODE}")
+    log(f"START BAL={get_balance()}")
 
     while True:
+
         try:
+
             t = now()
 
-            # ===== DAILY RESET =====
-            if t.date() != day:
+            # ===== new day reset =====
+
+            if day != t.date():
+
                 day = t.date()
-                day_start_balance = sim_balance
+                day_start_balance = get_balance()
                 blocked_today = False
-                loss_streak = 0
-                log("🔄 NEW DAY")
 
-            if pause_until and t < pause_until:
-                time.sleep(5)
-                continue
+                log("NEW DAY")
 
-            # ===== MANAGE OPEN POSITIONS =====
+            # ===== manage open trades =====
+
             for symbol in list(positions.keys()):
+
+                price = exchange.fetch_ticker(symbol)["last"]
+
                 pos = positions[symbol]
-                price = fetch_price(symbol)
 
-                hit_tp = price >= pos["tp"] if pos["side"] == "BUY" else price <= pos["tp"]
-                hit_sl = price <= pos["sl"] if pos["side"] == "BUY" else price >= pos["sl"]
+                if pos["side"]=="BUY":
 
-                if hit_tp or hit_sl:
-                    exit_price = pos["tp"] if hit_tp else pos["sl"]
-                    pnl = (
-                        (exit_price - pos["entry"]) * pos["qty"]
-                        if pos["side"] == "BUY"
-                        else (pos["entry"] - exit_price) * pos["qty"]
-                    )
-                    pnl -= pos["entry"] * pos["qty"] * FEE_RATE
-                    sim_balance += pnl
+                    if price <= pos["sl"]:
+                        close_trade(symbol, price, "SL")
 
-                    log(f"{'✅ TP' if hit_tp else '❌ SL'} {symbol} | PNL={pnl:.4f} | BAL={sim_balance:.4f}")
+                    elif price >= pos["tp"] and MODE=="SIM":
+                        close_trade(symbol, price, "TP")
 
-                    if hit_sl:
-                        loss_streak += 1
-                        if loss_streak >= MAX_LOSS_STREAK:
-                            pause_until = now() + timedelta(minutes=LOSS_PAUSE_MIN)
-                            log("⏸ LOSS STREAK → PAUSE 60 MIN")
-                    else:
-                        loss_streak = 0
-
-                    del positions[symbol]
-                    cooldown[symbol] = t + timedelta(minutes=COOLDOWN_MINUTES)
-
-                    if (day_start_balance - sim_balance) >= day_start_balance * DAILY_DD_LIMIT:
-                        blocked_today = True
-                        log("🚫 DAILY DD HIT")
-
-            # ===== ENTRY CHECK =====
-            if blocked_today:
-                time.sleep(3)
-                continue
-
-            for symbol, cfg in COINS.items():
-                if symbol in positions:
-                    continue
-                if symbol in cooldown and t < cooldown[symbol]:
-                    continue
-
-                ohlc = fetch_ohlc(symbol)
-                if len(ohlc) < 210:
-                    continue
-
-                closes = [x[4] for x in ohlc]
-
-                ema9   = ema(closes[-50:], 9)
-                ema21  = ema(closes[-50:], 21)
-                ema200 = ema(closes[-210:], 200)
-
-                side = None
-                price = closes[-1]
-
-                if ema9 > ema21 and price > ema200:
-                    side = "BUY"
-                elif ema9 < ema21 and price < ema200:
-                    side = "SELL"
                 else:
-                    continue
 
-                entry = fetch_price(symbol)
-                lot = cfg["lot"]
+                    if price >= pos["sl"]:
+                        close_trade(symbol, price, "SL")
 
-                tp = entry + TP_USDT / lot if side == "BUY" else entry - TP_USDT / lot
-                sl = entry - SL_USDT / lot if side == "BUY" else entry + SL_USDT / lot
+                    elif price <= pos["tp"] and MODE=="SIM":
+                        close_trade(symbol, price, "TP")
 
-                positions[symbol] = {
-                    "side": side,
-                    "entry": entry,
-                    "tp": tp,
-                    "sl": sl,
-                    "qty": lot
-                }
+            # ===== daily DD =====
 
-                log(f"📌 ENTRY {symbol} {side} @ {entry:.4f} | TP={tp:.4f} SL={sl:.4f}")
+            bal = get_balance()
+
+            if (day_start_balance - bal) >= day_start_balance * DAILY_DD_LIMIT:
+                blocked_today = True
+
+            # ===== entry =====
+
+            if not blocked_today:
+
+                for symbol in COINS:
+
+                    if symbol in positions:
+                        continue
+
+                    if symbol in cooldown and now() < cooldown[symbol]:
+                        continue
+
+                    df = fetch_ohlc(symbol)
+
+                    signal = ema_signal(df)
+
+                    if not signal:
+                        continue
+
+                    entry = exchange.fetch_ticker(symbol)["last"]
+
+                    open_trade(symbol, signal, entry)
 
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            log("ERROR: " + str(e))
+
+            log("ERROR " + str(e))
+            traceback.print_exc()
             time.sleep(5)
 
+# ================= START =================
 if __name__ == "__main__":
     main()
